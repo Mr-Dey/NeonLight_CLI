@@ -1,11 +1,20 @@
 # NeonLight CLI
 
-Control a Bluetooth LED / neon strip (MELK / ELK-BLEDOM family, normally driven by
-the **Magic Lantern** Android app) straight from a Linux terminal. Everything the app
-can do with a `MELK-OA10` controller is available, plus a few extras.
+Control Bluetooth LED / neon strips (MELK / ELK-BLEDOM family, normally driven by the
+**Magic Lantern** Android app) from a terminal on **Linux or Windows**. Everything the app can
+do with a `MELK-OA10` controller is available, plus music-reactive animations, screen sync
+and several strips at once, in a command line and an interactive terminal UI.
 
-Tested on a `MELK-OA10` controller from Garuda Linux (BlueZ + PipeWire) with Python 3.14
-and [bleak](https://github.com/hbldh/bleak).
+| | Linux | Windows 10/11 |
+|---|---|---|
+| Bluetooth control, effects, timers, several strips, terminal UI | ✅ BlueZ | ✅ Windows Bluetooth (WinRT) |
+| Music mode (computer audio or any mic) | ✅ PipeWire / PulseAudio (`parec`) | ✅ WASAPI (`soundcard`) |
+| Screen sync | ✅ desktop portal + PipeWire + GStreamer | ✅ `mss` screen grabs + Pillow |
+| Settings folder | `~/.config/lightctl` | `%APPDATA%\lightctl` |
+
+Developed on Garuda Linux (KDE Wayland, PipeWire) with Python 3.14 and
+[bleak](https://github.com/hbldh/bleak). The Windows back-ends are covered by tests with
+stand-ins for the Windows libraries; real-hardware testing on Windows is under way.
 
 ## Features
 
@@ -18,44 +27,102 @@ and [bleak](https://github.com/hbldh/bleak).
 - All 213 built-in effects from the app's Mode tab, by name, `tab:number` or id, with speed,
   plus `--tour` to browse them
 - **Music mode**: the app's crazy-fast beat strobe, or built-in animations pulsing with the music,
-  driven by whatever the laptop is playing or by any microphone (built-in, USB webcam, …)
-- **Screen sync**: the strip glows with the colour of what's on your monitor, with smooth fades
-  (Wayland/KDE via the desktop's screen-sharing portal)
+  driven by whatever the computer is playing or by any microphone (built-in, USB webcam, …)
+- **Screen sync**: the strips glow with the colour of what's on your monitor (or one window),
+  with smooth fades
 - The controller's own microphone mode (style, sensitivity)
 - On/off timers and clock, read back from the controller
 - Settings stored on the controller: wiring order, number of LEDs
-- Laptop-driven animations: `rainbow`, `breathe`, `fire`, `police`
+- Computer-driven animations: `rainbow`, `breathe`, `fire`, `police`
 - Byte-level tests against the app's protocol (`tests/`)
 
-## Install
+> **One connection per strip.** A strip accepts a single Bluetooth connection, so close the
+> phone app, and quit lightctl on any other computer, before connecting.
+
+## Install on Linux
+
+Needs Python 3.10+, BlueZ, and for music/screen sync PipeWire or PulseAudio (`parec`, `pactl`),
+`xdg-desktop-portal` and GStreamer with its PipeWire plugin (`gst-launch-1.0`, `pipewiresrc`).
 
 ```bash
 git clone git@github.com:Mr-Dey/NeonLight_CLI.git ~/projects/strip-light-cli
 cd ~/projects/strip-light-cli
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-chmod +x lightctl.py
-ln -sf "$PWD/lightctl.py" ~/.local/bin/lightctl
-```
-
-The shebang in `lightctl.py` points at `~/projects/strip-light-cli/.venv/bin/python`.
-If you clone somewhere else, edit that first line to your venv's Python.
-Music mode needs PulseAudio or PipeWire (`parec`, `pactl`). Screen sync needs
-`xdg-desktop-portal` and GStreamer with its PipeWire plugin (`gst-launch-1.0`, `pipewiresrc`).
-
-Find your strips and save them under names:
-
-```bash
+ln -sf "$PWD/lightctl.sh" ~/.local/bin/lightctl  # the launcher uses .venv next to it
 lightctl --scan
-lightctl --add-device monitor BE:69:32:13:B6:00
-lightctl --add-device room BE:69:04:14:32:04 --order rgb   # this one is wired R-G-B
-lightctl --devices
 ```
 
-Saved strips live in `~/.config/lightctl/devices.json`. Without any saved strips the
-CLI uses `$LIGHTCTL_ADDR`, or `DEFAULT_ADDR` from the script.
+## Install on Windows
 
-> Close the phone app first. The controller accepts only one BLE connection.
+Tested setup: Windows 10 (1709+) or 11 with a Bluetooth adapter that supports Bluetooth Low
+Energy (almost all built-in ones do). The strips need **no pairing**; don't add them in the
+Windows Bluetooth settings.
+
+1. **Python** - install Python 3.13 from <https://www.python.org/downloads/windows/>
+   (3.12-3.14 work too). In the installer tick **"Add python.exe to PATH"**.
+2. **Git** - install Git for Windows from <https://git-scm.com/download/win> (defaults are fine).
+3. **Windows Terminal** - the terminal UI looks best there (preinstalled on Windows 11;
+   free in the Microsoft Store on Windows 10).
+4. Open **Windows Terminal (PowerShell)** and run:
+
+   ```powershell
+   cd $HOME
+   git clone https://github.com/Mr-Dey/NeonLight_CLI.git
+   cd NeonLight_CLI
+   py -3.13 -m venv .venv            # or: python -m venv .venv
+   .venv\Scripts\pip install -r requirements.txt
+   ```
+
+   If the repository is private, Git opens a browser window to sign in to GitHub.
+   Every package comes as a ready-made Windows wheel, so no compiler is needed. If PowerShell
+   blocks something with an "execution policy" message, use the `.cmd` launcher as shown below
+   (it doesn't need scripts enabled).
+5. Make sure Bluetooth is **on** (Settings → Bluetooth & devices), the phone app is closed and
+   lightctl isn't running on another computer. Then find the strips:
+
+   ```powershell
+   .\lightctl --scan
+   ```
+
+6. Save them. Both strips already have their wiring stored on their controllers, so both use
+   plain `rgb`:
+
+   ```powershell
+   .\lightctl --add-device monitor BE:69:32:13:B6:00 --order rgb
+   .\lightctl --add-device room BE:69:04:14:32:04 --order rgb
+   .\lightctl -v --color red
+   ```
+
+7. Open the terminal UI:
+
+   ```powershell
+   .\lightctl
+   ```
+
+`.\lightctl` runs `lightctl.cmd`, which uses the `.venv` in the project folder. To type just
+`lightctl` from anywhere, add the project folder to your user PATH (Settings → System → About →
+Advanced system settings → Environment Variables → Path → New).
+
+### Windows test checklist
+
+Run these from the project folder and note what happens (copy any error text):
+
+```powershell
+.\lightctl --devices                          # both strips listed
+.\lightctl -v --color red                     # both strips red
+.\lightctl --mode yellow-marquee --speed 60   # both strips yellow, moving
+.\lightctl --list-sources                     # speakers ("computer audio") and microphones
+.\lightctl --music --duration 20              # play music first: strips strobe with it
+.\lightctl --music --effect random --switch beat --duration 20
+.\lightctl --list-windows                     # monitors and open windows
+.\lightctl --screen --duration 20             # play a colourful video: strips follow it
+.\lightctl --screen --capture "window:VLC" --duration 20   # part of a window title
+.\lightctl                                    # the terminal UI: try every tab
+```
+
+If something fails, send the full output of that command plus `.\lightctl -v --color red`, your
+Windows version (`winver`) and Python version (`py --version`).
 
 ## Terminal UI
 
@@ -79,9 +146,13 @@ Keys: `1`–`7` switch tabs, arrows move between items and change sliders, Enter
 Only one mode (music, screen sync, animation or effect tour) runs at a time; turning one on
 switches the others off. The UI keeps one Bluetooth connection to every strip, so a colour change
 takes about 0.15 s instead of a 3–5 s reconnect per command. Settings are remembered in
-`~/.config/lightctl/ui.json`.
+`ui.json` in the settings folder. On Windows, tab 4 also lists your monitors and open windows
+to capture.
 
 ## Usage
+
+On Windows, type `.\lightctl` instead of `lightctl` (unless the folder is on your PATH), and set
+variables with `$env:LIGHTCTL_MIC="logitech"` (PowerShell) instead of `export`.
 
 ```bash
 # which strips: every saved strip by default, or pick with -D / --device
@@ -122,6 +193,8 @@ lightctl --screen --smooth 0.3 --saturation 3 --gain 1.6   # slower fades, vivid
 lightctl --screen --fps 30                    # target rate; capped at what the link delivers
 lightctl --screen --region edges --floor 0    # only the screen edges; off in dark scenes
 lightctl --screen --capture window            # only the video player window (pick it once)
+lightctl --screen --capture "window:VLC"      # Windows: the window whose title contains VLC
+lightctl --screen --capture monitor:2         # Windows: a specific monitor (see --list-windows)
 lightctl --screen --sample average            # plain average instead of the scene's main colour
 lightctl --screen-reset                       # pick a different monitor next time
 
@@ -166,12 +239,14 @@ Built-in effects are drawn by each controller itself, so for them to match:
 ## Music mode
 
 `--music` does what the app's Music tab does. About 10 times a second it measures
-the audio level (8 kHz mono, `10*log10(mean square)` like the app). Each loud frame
+the audio level (`10*log10(mean square)` of 16-bit samples, like the app; Linux records 8 kHz
+mono through `parec`, Windows 48 kHz through WASAPI, same scale). Each loud frame
 gets the next colour of the app's palette (red, green, blue, yellow, magenta, cyan,
 white) and each quiet frame goes dark. Frames use the app's music frame
 `7e 07 05 03 R G B 20 ef`.
 
-- **Laptop audio** (`--music` / `--music system`): quiet means below `--threshold` (40 dB).
+- **Computer audio** (`--music` / `--music system`): what the default speakers play
+  (a PipeWire monitor on Linux, WASAPI loopback on Windows). Quiet means below `--threshold` (40 dB).
 - **Microphones**: quiet means less than 3 dB above the quietest level of the last
   30 seconds, so the strip follows the room. Use `--threshold` for a fixed level.
 - `--react mic` switches to the app's phone-mic logic. It learns the background level
@@ -189,12 +264,18 @@ on the tested unit, and changing its sensitivity in real time did not animate it
 
 ## Screen sync
 
-`--screen` asks the desktop for a screen-cast through `xdg-desktop-portal` (KDE shows its
-"share your screen" picker the first time). The permission is saved in
-`~/.config/lightctl/screencast-token`, so later runs start straight away. While it runs, KDE
-shows its usual screen-sharing indicator.
+**Linux:** `--screen` asks the desktop for a screen-cast through `xdg-desktop-portal` (KDE shows
+its "share your screen" picker the first time). The permission is saved in the settings folder
+(`screencast-token`), so later runs start straight away. While it runs, KDE shows its usual
+screen-sharing indicator.
 
-GStreamer receives the PipeWire stream (at most 20 frames/s), shrinks each frame to 48×27
+**Windows:** `mss` grabs the primary monitor (or `--capture monitor:N`, or a window with
+`--capture "window:part of the title"`; plain `--capture window` follows the next window you
+click). Pillow shrinks each grab with a box filter, which is the same true area average. A window
+is captured as it appears on screen, so keep it uncovered; while it's minimised the strip dims.
+Grabs run at up to 15 frames/s (the link carries ~10-16 updates/s anyway).
+
+On Linux, GStreamer receives the PipeWire stream (at most 20 frames/s), shrinks each frame to 48×27
 with an area-averaging filter (`bilinear2`, so every cell is the true average of its part of
 the screen) and hands it to Python. `--capture window` shares a single window instead of the
 monitor, so a video that isn't full screen isn't mixed with the desktop.
@@ -283,7 +364,9 @@ the laptop side only, and built-in effects stay wrong. One tested strip turned o
 Every frame builder is checked byte for byte against values transcribed from the app's
 `BluetoothLEService`, along with the effect table, the music palette and the music logic.
 `tests/test_ui.py` drives the terminal UI headlessly with fake strips: colours, sliders, effect
-search, switching modes and leaving out a strip.
+search, switching modes and leaving out a strip. `tests/test_windows.py` runs the Windows
+back-ends with stand-ins for `soundcard` and `mss` (audio levels, monitor and window capture,
+picking sources) and the UI's Windows monitor/window pickers; it needs numpy and Pillow.
 
 ## How it was figured out
 

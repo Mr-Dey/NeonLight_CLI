@@ -38,6 +38,7 @@ DEFAULTS = {
     "screen_smooth": 0.12, "screen_saturation": 1.3, "screen_region": "full", "screen_floor": 5,
     "screen_gain": 1.25, "screen_fps": 12,
     "screen_sample": "dominant", "screen_capture": "monitor", "screen_led_gamma": 1.0,
+    "screen_monitor": 0, "screen_window": "",  # Windows: which monitor (0 = primary) / window title
     "animation": "rainbow", "anim_period": 6.0,
     "timer_days": "daily",
     "muted": [],
@@ -76,6 +77,10 @@ def load_settings() -> dict:
             s[key] = DEFAULTS[key]
     if not isinstance(s["muted"], list):
         s["muted"] = []
+    if not isinstance(s["screen_monitor"], int) or s["screen_monitor"] < 0:
+        s["screen_monitor"] = 0
+    if not isinstance(s["screen_window"], str):
+        s["screen_window"] = ""
     return s
 
 
@@ -172,6 +177,7 @@ class LightUI(App):
     #music-effect { width: 1fr; }
     #music-switch { width: 30; }
     #screen-fps { width: 36; }
+    #screen-monitor, #screen-window { width: 1fr; }
     RadioSet { margin: 0 1; width: auto; }
     #timer-view { margin: 1 1; height: auto; }
     .timer-in { width: 12; }
@@ -306,14 +312,26 @@ class LightUI(App):
                     yield Label("Capture", classes="section")
                     with RadioSet(id="screen-capture"):
                         yield RadioButton("Whole monitor", value=s["screen_capture"] == "monitor", id="sc-monitor")
-                        yield RadioButton("One window - e.g. the video player (pick it in the dialog)",
+                        yield RadioButton("One window - e.g. the video player" +
+                                          ("" if L.IS_WINDOWS else " (pick it in the dialog)"),
                                           value=s["screen_capture"] == "window", id="sc-window")
+                    if L.IS_WINDOWS:
+                        with Horizontal(classes="row"):
+                            yield Label("Monitor", classes="lbl")
+                            yield Select(self.monitor_options(), value=self.valid_monitor(s["screen_monitor"]),
+                                         allow_blank=False, id="screen-monitor")
+                        with Horizontal(classes="row"):
+                            yield Label("Window", classes="lbl")
+                            yield Select(self.window_options(), value=self.valid_window(s["screen_window"]),
+                                         allow_blank=False, id="screen-window")
+                            yield Button("↻", id="refresh-windows")
                     yield Label("Sample", classes="section")
                     with RadioSet(id="screen-region"):
                         yield RadioButton("Whole screen", value=s["screen_region"] == "full", id="sr-full")
                         yield RadioButton("Edges only", value=s["screen_region"] == "edges", id="sr-edges")
-                    yield Label("The first time, KDE asks which screen to share. "
-                                "Tip: switch off strips that aren't behind the monitor in tab 7.", classes="hint")
+                    yield Label(("A window is captured as it appears on screen: keep it uncovered (minimised = dark). "
+                                 if L.IS_WINDOWS else "The first time, your desktop asks which screen to share. ")
+                                + "Tip: switch off strips that aren't behind the monitor in tab 7.", classes="hint")
                     yield Label("Each strip's Bluetooth link carries about 10-16 updates per second, so higher "
                                 "rates run as fast as the link allows; the top bar shows the real rate.", classes="hint")
             with TabPane("5 Animations", id="anim"):
@@ -364,12 +382,39 @@ class LightUI(App):
         yield Footer()
 
     def source_options(self) -> list[tuple[str, str]]:
-        opts = [("Laptop audio - whatever is playing", "system"), ("Default microphone", "mic")]
+        opts = [("Computer audio - whatever is playing", "system"), ("Default microphone", "mic")]
         with contextlib.suppress(SystemExit, OSError, ValueError):
             for src in L.audio_sources():
                 if not src["monitor"]:
                     opts.append((f"Microphone: {src['desc']}", src["name"]))
         return opts
+
+    def monitor_options(self) -> list[tuple[str, int]]:
+        opts = [("Primary monitor", 0)]
+        with contextlib.suppress(Exception):
+            import winbackend
+            for m in winbackend.list_monitors():
+                opts.append((f"Monitor {m['index']}: {m['width']}x{m['height']}"
+                             + (" (primary)" if m["primary"] else "") + (f" {m['name']}" if m["name"] else ""),
+                             m["index"]))
+        return opts
+
+    def valid_monitor(self, value: int) -> int:
+        return value if value in [v for _, v in self.monitor_options()] else 0
+
+    def window_options(self) -> list[tuple[str, str]]:
+        opts = [("The next window I click (10 s)", "")]
+        with contextlib.suppress(Exception):
+            import winbackend
+            seen = set()
+            for w in winbackend.list_windows():
+                if w["title"] not in seen:
+                    seen.add(w["title"])
+                    opts.append((w["title"][:70], w["title"]))
+        return opts
+
+    def valid_window(self, value: str) -> str:
+        return value if value in [v for _, v in self.window_options()] else ""
 
     def valid_source(self, value: str) -> str:
         return value if value in [v for _, v in self.source_options()] else "system"
@@ -527,12 +572,18 @@ class LightUI(App):
         react = "music" if s["music_style"] == "strobe" else "mic"
         return lambda: L.music(self.group, src, react, 10, L.MUSIC_PALETTE, None, 0, False)
 
+    def capture_target(self) -> str:
+        s = self.s
+        if s["screen_capture"] == "window":
+            return f"window:{s['screen_window']}" if L.IS_WINDOWS and s["screen_window"] else "window"
+        return f"monitor:{s['screen_monitor']}" if L.IS_WINDOWS and s["screen_monitor"] else "monitor"
+
     def screen_job(self):
         s = self.s
+        target = self.capture_target()
         return lambda: L.screen_sync(self.group, int(s["screen_fps"]), s["screen_smooth"], s["screen_region"],
                                      s["screen_saturation"], int(s["screen_floor"]), 0, False,
-                                     s["screen_gain"], s["screen_sample"], s["screen_led_gamma"],
-                                     s["screen_capture"])
+                                     s["screen_gain"], s["screen_sample"], s["screen_led_gamma"], target)
 
     def anim_job(self):
         s = self.s
@@ -754,6 +805,23 @@ class LightUI(App):
         self.save(screen_fps=int(ev.value))
         if self.mode_name == "screen":
             self.restart_soon("screen")
+
+    @on(Select.Changed, "#screen-monitor")
+    @on(Select.Changed, "#screen-window")
+    def screen_target(self, ev: Select.Changed) -> None:
+        if ev.select.id == "screen-monitor":
+            self.save(screen_monitor=int(ev.value))
+        else:
+            self.save(screen_window=str(ev.value))
+        if self.mode_name == "screen":
+            self.restart_soon("screen")
+
+    @on(Button.Pressed, "#refresh-windows")
+    def refresh_windows(self) -> None:
+        sel = self.query_one("#screen-window", Select)
+        sel.set_options(self.window_options())
+        sel.value = self.valid_window(self.s["screen_window"])
+        self.log_line("window list refreshed")
 
     @on(RadioSet.Changed, "#screen-region")
     @on(RadioSet.Changed, "#screen-sample")

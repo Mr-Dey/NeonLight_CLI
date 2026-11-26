@@ -208,7 +208,6 @@ class FakeClient:
 
 class GroupWrites(unittest.TestCase):
     def group(self, *orders):
-        import asyncio  # noqa: F401
         g = L.Group([])
         for i, order in enumerate(orders):
             d = L.Device(f"s{i}", f"AA:BB:CC:DD:EE:0{i}", order)

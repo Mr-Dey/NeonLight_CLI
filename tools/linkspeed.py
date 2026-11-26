@@ -11,11 +11,15 @@
 Nothing is stored: the faster interval only lasts for this connection.
 """
 import asyncio
-import fcntl
 import os
 import socket
 import struct
 import sys
+
+if sys.platform != "linux":
+    raise SystemExit("tools/linkspeed.py needs Linux (raw Bluetooth controller access)")
+
+import fcntl  # noqa: E402
 import threading
 import time
 

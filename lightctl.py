@@ -1,4 +1,4 @@
-#!/home/subhasish/projects/strip-light-cli/.venv/bin/python
+#!/usr/bin/env python3
 """lightctl - control a MELK / ELK-BLEDOM Bluetooth LED strip from Linux.
 
 Protocol taken from the Magic Lantern app (wl.smartled.rgb 6.11.13,
@@ -42,6 +42,9 @@ import sys
 import time
 
 from bleak import BleakClient, BleakScanner
+
+
+IS_WINDOWS = sys.platform == "win32"
 
 
 def log(msg: str, err: bool = True) -> None:
@@ -523,6 +526,28 @@ def days_str(mask: int) -> str:
     return ",".join(d for i, d in enumerate(DAY_NAMES) if mask >> i & 1) or "no days"
 
 
+def parse_capture(s: str) -> str:
+    kind, sep, arg = s.strip().partition(":")
+    kind = kind.lower()
+    if kind not in ("monitor", "window") or (kind == "monitor" and sep and not arg.strip().isdigit()):
+        raise argparse.ArgumentTypeError("use monitor, monitor:N, window or window:TITLE")
+    return f"{kind}{sep}{arg.strip()}" if sep else kind
+
+
+def list_windows() -> None:
+    if not IS_WINDOWS:
+        print("On Linux the desktop asks which monitor or window to share when screen sync starts.")
+        return
+    import winbackend
+    print("Monitors (--capture monitor:N):")
+    for m in winbackend.list_monitors():
+        print(f"  {m['index']}  {m['width']}x{m['height']} at {m['left']},{m['top']}"
+              + ("   primary - used by --capture monitor" if m["primary"] else "") + (f"   {m['name']}" if m["name"] else ""))
+    print("\nWindows (--capture \"window:part of the title\"):")
+    for w in winbackend.list_windows():
+        print(f"  {w['title']}")
+
+
 def parse_raw(s: str) -> bytes:
     try:
         return bytes.fromhex(s.replace(":", " "))
@@ -573,7 +598,8 @@ async def tour(devices: list[Device], filter_: str | None, interval: float, spee
 
 # ---------- devices: one or more strips, controlled together ----------
 
-CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "lightctl")
+CONFIG_DIR = (os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "lightctl") if IS_WINDOWS else
+              os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "lightctl"))
 DEVICES_FILE = os.path.join(CONFIG_DIR, "devices.json")
 MAC_RE = re.compile(r"[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}")
 
@@ -927,7 +953,7 @@ MUSIC_PALETTE = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0),
 AUDIO_RATE = 8000  # the app records at 8 kHz mono 16-bit
 
 
-def _pactl(*args: str) -> str:
+def _pactl(*args: str) -> str:  # Linux only
     try:
         return subprocess.run(["pactl", *args], capture_output=True, text=True, check=True).stdout
     except (OSError, subprocess.CalledProcessError) as e:
@@ -935,7 +961,11 @@ def _pactl(*args: str) -> str:
 
 
 def audio_sources() -> list[dict]:
-    """Every audio input: microphones, and 'monitors' that carry what the laptop is playing."""
+    """Every audio input: microphones, and 'monitor' inputs that carry what the computer is playing.
+    Each is {"name": id, "desc": readable name, "monitor": bool}."""
+    if IS_WINDOWS:
+        import winbackend
+        return winbackend.audio_sources()
     out = []
     for s in json.loads(_pactl("-f", "json", "list", "sources")):
         props = s.get("properties", {})
@@ -944,55 +974,121 @@ def audio_sources() -> list[dict]:
     return out
 
 
+def default_audio() -> tuple[str | None, str | None]:
+    """(name of the input carrying what the computer plays, name of the default microphone)."""
+    if IS_WINDOWS:
+        import winbackend
+        return winbackend.default_audio()
+    return _pactl("get-default-sink").strip() + ".monitor", _pactl("get-default-source").strip()
+
+
+def choose_audio_source(source: str, sources: list[dict], default_out: str | None,
+                        default_mic: str | None, preferred_mic: str | None = None) -> dict:
+    """'system' | 'mic' | number (as --list-sources prints) | name | part of a name -> one source."""
+    def named(name: str | None) -> dict | None:
+        return next((s for s in sources if s["name"] == name), None) if name else None
+
+    if source == "system":
+        pick = named(default_out)
+        if pick is None or not pick["monitor"]:
+            pick = next((s for s in sources if s["monitor"]), None)
+        if pick is None:
+            raise SystemExit("lightctl: found no input that carries what the computer plays")
+        return pick
+    if source == "mic":
+        if not preferred_mic:
+            pick = named(default_mic)
+            if pick is None or pick["monitor"]:
+                pick = next((s for s in sources if not s["monitor"]), None)
+            if pick is None:
+                raise SystemExit("lightctl: found no microphone")
+            return pick
+        source = preferred_mic
+    if source.isdigit():
+        i = int(source)
+        if not 1 <= i <= len(sources):
+            raise SystemExit(f"lightctl: no audio input #{i}; see lightctl --list-sources")
+        return sources[i - 1]
+    exact = [s for s in sources if s["name"] == source]
+    hits = exact or [s for s in sources if source.lower() in (s["name"] + " " + s["desc"]).lower()]
+    if len(hits) > 1:  # a name can match a device's mic and its output monitor: prefer the mic
+        mics = [s for s in hits if not s["monitor"]]
+        hits = mics if len(mics) == 1 else hits
+    if not hits:
+        raise SystemExit(f"lightctl: no audio input matches {source!r}. Is it plugged in? "
+                         "See lightctl --list-sources")
+    if len(hits) > 1:
+        names = "\n  ".join(f"{s['desc']}  ({s['name']})" for s in hits)
+        raise SystemExit(f"lightctl: {source!r} matches several inputs, be more specific:\n  {names}")
+    return hits[0]
+
+
+def pick_audio_source(source: str) -> dict:
+    out, mic = default_audio()
+    return choose_audio_source(source, audio_sources(), out, mic, os.environ.get("LIGHTCTL_MIC"))
+
+
 def list_sources() -> None:
     srcs = audio_sources()
-    default_mic = _pactl("get-default-source").strip()
-    default_mon = _pactl("get-default-sink").strip() + ".monitor"
+    out, mic = default_audio()
     preferred = os.environ.get("LIGHTCTL_MIC")
     print("Audio inputs for --music (use the number, or any part of the name):")
     for i, s in enumerate(srcs, 1):
-        kind = "laptop audio" if s["monitor"] else "microphone"
+        kind = "computer audio" if s["monitor"] else "microphone"
         tags = []
-        if s["name"] == default_mon:
+        if s["monitor"] and s["name"] == out:
             tags.append("used by --music / --music system")
-        if s["name"] == default_mic and not preferred:
+        if not s["monitor"] and s["name"] == mic and not preferred:
             tags.append("used by --music mic")
-        print(f"  {i:>2}  {kind:<12}  {s['desc']}" + (f"   <- {'; '.join(tags)}" if tags else ""))
-        print(f"      {'':<12}  {s['name']}")
+        print(f"  {i:>2}  {kind:<14}  {s['desc']}" + (f"   <- {'; '.join(tags)}" if tags else ""))
+        print(f"      {'':<14}  {s['name']}")
     if preferred:
         print(f"\nLIGHTCTL_MIC={preferred!r} -> used by --music mic")
-    print("\nexamples:  lightctl --music 2     lightctl --music webcam     export LIGHTCTL_MIC=logitech")
+    setting = "set LIGHTCTL_MIC=logitech" if IS_WINDOWS else "export LIGHTCTL_MIC=logitech"
+    print(f"\nexamples:  lightctl --music 2     lightctl --music webcam     {setting}")
 
 
-def pulse_source(source: str) -> tuple[str, str]:
-    """'system' | 'mic' | number | name | part of a name -> (source name, default reaction style)."""
-    if source == "system":
-        return _pactl("get-default-sink").strip() + ".monitor", "music"
-    if source == "mic":
-        preferred = os.environ.get("LIGHTCTL_MIC")
-        if not preferred:
-            return _pactl("get-default-source").strip(), "mic"
-        source = preferred
-    srcs = audio_sources()
-    if source.isdigit():
-        i = int(source)
-        if not 1 <= i <= len(srcs):
-            raise SystemExit(f"lightctl: no audio input #{i}; see lightctl --list-sources")
-        pick = srcs[i - 1]
-    else:
-        exact = [s for s in srcs if s["name"] == source]
-        hits = exact or [s for s in srcs if source.lower() in (s["name"] + " " + s["desc"]).lower()]
-        if len(hits) > 1:  # a name can match a device's mic and its output monitor: prefer the mic
-            mics = [s for s in hits if not s["monitor"]]
-            hits = mics if len(mics) == 1 else hits
-        if not hits:
-            raise SystemExit(f"lightctl: no audio input matches {source!r}. Is it plugged in? "
-                             "See lightctl --list-sources")
-        if len(hits) > 1:
-            names = "\n  ".join(f"{s['desc']}  ({s['name']})" for s in hits)
-            raise SystemExit(f"lightctl: {source!r} matches several inputs, be more specific:\n  {names}")
-        pick = hits[0]
-    return pick["name"], "music" if pick["monitor"] else "mic"
+class AudioInput:
+    """Audio levels for music mode: one dB value (the app's scale) per 1/fps seconds.
+    Linux: PulseAudio/PipeWire through parec. Windows: WASAPI through soundcard (winbackend.py)."""
+
+    def __init__(self, source: str, fps: float) -> None:
+        self.fps = fps
+        src = pick_audio_source(source)
+        self.name, self.desc, self.monitor = src["name"], src["desc"], src["monitor"]
+        self.kind = "music" if self.monitor else "mic"  # computer audio or a microphone
+        self.proc = None
+        self.win = None
+
+    async def __aenter__(self) -> "AudioInput":
+        if IS_WINDOWS:
+            import winbackend
+            self.win = winbackend.WinAudioInput(self.name, self.monitor, self.fps)
+            await self.win.start()
+        else:
+            self.proc = await asyncio.create_subprocess_exec(
+                "parec", "--raw", "--format=s16le", f"--rate={AUDIO_RATE}", "--channels=1",
+                f"--latency-msec={max(10, round(500 / self.fps))}", "-d", self.name,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        return self
+
+    async def level(self) -> float:
+        if self.win is not None:
+            return await self.win.level()
+        try:
+            buf = await self.proc.stdout.readexactly(max(1, round(AUDIO_RATE / self.fps)) * 2)
+        except asyncio.IncompleteReadError:
+            err = (await self.proc.stderr.read()).decode(errors="replace").strip()
+            raise SystemExit(f"lightctl: audio capture from {self.name!r} stopped: "
+                             f"{err or 'parec exited'}") from None
+        return level_db(buf)
+
+    async def __aexit__(self, *exc) -> None:
+        if self.win is not None:
+            await self.win.stop()
+        if self.proc is not None and self.proc.returncode is None:
+            self.proc.terminate()
+            await self.proc.wait()
 
 
 def level_db(buf: bytes) -> float:
@@ -1082,17 +1178,11 @@ async def music_effects(devices: list[Device], source: str, fps: float, effects:
                         speed: int | None, floor: int, duration: float, verbose: bool) -> None:
     """Built-in animation keeps running on the controller; the laptop pulses its brightness with the
     music and can rotate effects every N seconds or on strong beats."""
-    dev, _ = pulse_source(source)
-    chunk = max(1, round(AUDIO_RATE / fps))
     every = None if switch in (None, "beat") else float(switch)
-    proc = await asyncio.create_subprocess_exec(
-        "parec", "--raw", "--format=s16le", f"--rate={AUDIO_RATE}", "--channels=1",
-        f"--latency-msec={max(10, round(500 / fps))}", "-d", dev,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     norm = LevelNorm(fps)
     pos = 0
     try:
-        async with _connected(devices, verbose) as g:
+        async with AudioInput(source, fps) as audio, _connected(devices, verbose) as g:
             async def start(i: int) -> None:
                 name, mid = resolve_effect(effects[i % len(effects)])
                 log(f"effect: {name} (0x{mid:02x})")
@@ -1105,12 +1195,12 @@ async def music_effects(devices: list[Device], source: str, fps: float, effects:
                 speed = SYNC_SPEED
             if speed is not None:
                 await g.write(cmd_speed(speed))
-            log(f"music + effect on {g.names()}, listening to {dev}")
+            log(f"music + effect on {g.names()}, listening to {audio.desc}")
             loop = asyncio.get_running_loop()
             t0 = last_switch = loop.time()
             last_v = None
             while not duration or loop.time() - t0 < duration:
-                d = level_db(await proc.stdout.readexactly(chunk * 2))
+                d = await audio.level()
                 x = norm(d)
                 now = loop.time()
                 beat = x >= 0.9 and now - last_switch >= 1.0
@@ -1125,40 +1215,26 @@ async def music_effects(devices: list[Device], source: str, fps: float, effects:
                 if verbose:
                     log(f"{d:6.1f} dB  level {x:4.2f}  brightness {v:3d}")
             await g.write(cmd_brightness(100))
-    except asyncio.IncompleteReadError:
-        err = (await proc.stderr.read()).decode(errors="replace").strip()
-        raise SystemExit(f"lightctl: audio capture from {dev!r} stopped: {err or 'parec exited'}") from None
     except asyncio.CancelledError:
         pass
-    finally:
-        if proc.returncode is None:
-            proc.terminate()
-            await proc.wait()
 
 
 async def music(devices: list[Device], source: str, react: str | None, fps: float, palette: list,
                 threshold: float | None, duration: float, verbose: bool) -> None:
-    dev, kind = pulse_source(source)  # kind: 'music' for laptop-audio monitors, 'mic' for microphones
     react = react or "music"
-    chunk = max(1, round(AUDIO_RATE / fps))
-    gate = AutoGate(fps) if react == "music" and kind == "mic" and threshold is None else None
-    if threshold is None:
-        threshold = 40.0
-    proc = await asyncio.create_subprocess_exec(
-        "parec", "--raw", "--format=s16le", f"--rate={AUDIO_RATE}", "--channels=1",
-        f"--latency-msec={max(10, round(500 / fps))}", "-d", dev,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-    mic = MicReact() if react == "mic" else None
     idx, frames = 0, 0
     try:
-        async with _connected(devices, verbose) as g:
+        async with AudioInput(source, fps) as audio, _connected(devices, verbose) as g:
+            # microphones never hear true silence: follow the room instead of a fixed level
+            gate = AutoGate(fps) if react == "music" and audio.kind == "mic" and threshold is None else None
+            limit = 40.0 if threshold is None else threshold
+            mic = MicReact() if react == "mic" else None
             await g.write(cmd_power(True))
-            log(f"music mode ({react} style) on {g.names()}, listening to {dev} at {fps:g} frames/s")
+            log(f"music mode ({react} style) on {g.names()}, listening to {audio.desc} at {fps:g} frames/s")
             loop = asyncio.get_running_loop()
             t0 = loop.time()
             while not duration or loop.time() - t0 < duration:
-                buf = await proc.stdout.readexactly(chunk * 2)
-                d = level_db(buf)
+                d = await audio.level()
                 if mic is not None:
                     loud = mic(d)
                     if loud is None:
@@ -1168,27 +1244,21 @@ async def music(devices: list[Device], source: str, react: str | None, fps: floa
                     if loud is None:
                         continue
                 else:  # Music-tab logic: a new colour every frame unless (near) silent
-                    loud = d >= threshold
+                    loud = d >= limit
                 if loud:
                     idx = (idx + 1) % len(palette)  # the app advances the palette, then uses it
                     rgb = palette[idx]
                 else:
                     rgb = (0, 0, 0)
-                await g.stream(lambda d, rgb=rgb: cmd_music(*rgb, order=d.order))
+                await g.stream(lambda dev, rgb=rgb: cmd_music(*rgb, order=dev.order))
                 frames += 1
                 if verbose:
                     bar = "#" * max(0, min(40, int((d - 20) / 2))) if d > -1e9 else ""
                     gate_txt = f" floor {gate.floor():5.1f}" if gate is not None else ""
                     log(f"{d:6.1f} dB{gate_txt} {bar:<40} {'%02x%02x%02x' % rgb}")
-    except asyncio.IncompleteReadError:
-        err = (await proc.stderr.read()).decode(errors="replace").strip()
-        raise SystemExit(f"lightctl: audio capture from {dev!r} stopped: {err or 'parec exited'}") from None
     except asyncio.CancelledError:
         pass
     finally:
-        if proc.returncode is None:
-            proc.terminate()
-            await proc.wait()
         if verbose:
             log(f"{frames} music frames sent")
 
@@ -1196,8 +1266,7 @@ async def music(devices: list[Device], source: str, react: str | None, fps: floa
 # ---------- screen sync: the strip glows with the colour of what's on screen ----------
 
 SCREEN_W, SCREEN_H = 48, 27  # GStreamer shrinks every frame to this before Python looks at it
-TOKEN_FILE = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
-                          "lightctl", "screencast-token")
+TOKEN_FILE = os.path.join(CONFIG_DIR, "screencast-token")  # Linux: remembered screen-share permission
 
 
 class ScreenCapture:
@@ -1441,15 +1510,26 @@ def screen_color(frame: bytes, region: str = "full", saturation: float = 1.3, fl
     return ScreenSampler(mode, region, saturation, floor, gain, led_gamma)(frame)
 
 
+def open_screen_capture(fps: float, verbose: bool, capture: str):
+    """capture: 'monitor', 'monitor:N', 'window' or 'window:TITLE'. On Linux the desktop's dialog
+    picks the monitor/window (N and TITLE are Windows-only); on Windows mss grabs it directly."""
+    if IS_WINDOWS:
+        import winbackend
+        return winbackend.WinScreenCapture(fps, verbose, capture, SCREEN_W, SCREEN_H, log=log)
+    return ScreenCapture(fps, verbose, capture.partition(":")[0])
+
+
 async def screen_sync(devices: list[Device], fps: float, smooth: float, region: str, saturation: float,
                       floor: int, duration: float, verbose: bool, gain: float = 1.25,
                       mode: str = "dominant", led_gamma: float = 1.0, capture: str = "monitor") -> None:
     """Capture -> one colour per frame -> smooth fade at `fps` -> unacknowledged colour frames."""
     target: list[float] | None = None
     sampler = ScreenSampler(mode, region, saturation, floor, gain, led_gamma)
-    # capturing faster than ~20/s costs CPU (and laptop heat) without making the light smoother:
-    # the link delivers ~10-16 updates/s and the fade fills in between
-    async with ScreenCapture(min(fps, 20), verbose, capture) as cap, _connected(devices, verbose) as g:
+    # capturing faster than this costs CPU (and laptop heat) without making the light smoother:
+    # the link delivers ~10-16 updates/s and the fade fills in between. Grabbing on Windows (mss + Pillow)
+    # costs more per frame than PipeWire on Linux, so it is capped a little lower there.
+    cap_fps = min(fps, 15 if IS_WINDOWS else 20)
+    async with open_screen_capture(cap_fps, verbose, capture) as cap, _connected(devices, verbose) as g:
         await g.write(cmd_power(True))
         await g.write(cmd_brightness(100, 0x01))
         log(f"screen sync on {g.names()}: {SAMPLE_MODES[mode]}, up to {fps:g} updates/s, fade {smooth:g}s")
@@ -1616,7 +1696,7 @@ def main() -> None:
 
     m = p.add_argument_group("sound")
     m.add_argument("--music", nargs="?", const="system", metavar="SOURCE",
-                   help="stream the app's music animation from laptop audio: 'system' (what is playing, "
+                   help="stream the app's music animation from computer audio: 'system' (what is playing, "
                         "default), 'mic' (default mic, or $LIGHTCTL_MIC), or an input number / name / "
                         "part of a name from --list-sources (e.g. 'webcam', 'logitech')")
     m.add_argument("--list-sources", action="store_true", help="list microphones and other audio inputs")
@@ -1656,8 +1736,10 @@ def main() -> None:
     sc.add_argument("--led-gamma", type=float, default=1.0,
                     help="1.0 = send true light mixes, right for PWM LEDs (default); 2.2 = paler, "
                          "screen-like (original)")
-    sc.add_argument("--capture", choices=["monitor", "window"], default="monitor",
-                    help="share a whole monitor (default) or just one window, e.g. the video player")
+    sc.add_argument("--capture", type=parse_capture, default="monitor", metavar="TARGET",
+                    help="monitor (default), window = only one window e.g. the video player. Windows also: "
+                         "monitor:N, window:TITLE (see --list-windows); on Linux the desktop asks in a dialog")
+    sc.add_argument("--list-windows", action="store_true", help="Windows: list monitors and windows to capture")
     sc.add_argument("--screen-reset", action="store_true",
                     help="forget the shared-monitor choice so the next --screen asks again")
 
@@ -1702,6 +1784,10 @@ def main() -> None:
                    help="send a raw 9-byte payload (repeatable)")
     c.add_argument("-v", "--verbose", action="store_true", help="print bytes sent / audio levels")
     c.add_argument("--ui", action="store_true", help="open the interactive terminal UI (same as no arguments)")
+    if IS_WINDOWS:  # never crash on a character the console can't show
+        for stream in (sys.stdout, sys.stderr):
+            with contextlib.suppress(AttributeError, ValueError):
+                stream.reconfigure(errors="replace")
     if len(sys.argv) == 1 and sys.stdin.isatty() and sys.stdout.isatty():
         sys.argv.append("--ui")
     a = p.parse_args()
@@ -1750,6 +1836,9 @@ def main() -> None:
         return
     if a.list_sources:
         list_sources()
+        return
+    if a.list_windows:
+        list_windows()
         return
     if a.scan:
         run(scan(8))

@@ -1,2 +1,7 @@
 bleak>=3.1.0
 textual>=8.2
+# Windows only: music mode (WASAPI audio) and screen sync (screen grabs)
+numpy>=1.26; sys_platform == "win32"
+soundcard>=0.4.6; sys_platform == "win32"
+mss>=10.2; sys_platform == "win32"
+Pillow>=10.0; sys_platform == "win32"

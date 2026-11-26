@@ -41,6 +41,7 @@ DEVICES = [L.Device("monitor", "AA:BB:CC:DD:EE:01", "gbr"), L.Device("room", "AA
 
 class UITest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        asyncio.get_running_loop().slow_callback_duration = 2  # Textual start-up
         self.tmp = tempfile.TemporaryDirectory()
         self.saved = (U.SETTINGS_FILE, L.Group, L.music_effects, L.music, L.screen_sync, L.animate, L.tour)
         U.SETTINGS_FILE = os.path.join(self.tmp.name, "ui.json")
