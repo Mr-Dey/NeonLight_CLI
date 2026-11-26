@@ -590,6 +590,23 @@ async def send(addr: str, packets: list[tuple[str, bytes]], verbose: bool, retri
                      "Hint: close the phone app (the strip accepts only one connection).")
 
 
+class Stream:
+    """Fast writes for animations, music and screen sync without lag building up.
+
+    The link carries only ~13 writes/s (the strip asks for a ~75 ms connection interval).
+    Unacknowledged writes are accepted instantly and queue up, so streaming faster than that makes
+    the strip fall further and further behind. Every `barrier`-th write is acknowledged: it returns
+    only once everything queued before it has been delivered, so at most a few frames are ever waiting.
+    """
+
+    def __init__(self, client: BleakClient, barrier: int = 4) -> None:
+        self.client, self.barrier, self.n = client, barrier, 0
+
+    async def send(self, pkt: bytes) -> None:
+        self.n += 1
+        await self.client.write_gatt_char(WRITE_CHAR, pkt, response=self.n % self.barrier == 0)
+
+
 # ---------- clock & timers (stored on the controller; read back the way the app does) ----------
 
 async def _read_frame(client: BleakClient, cmd: int, length: int) -> bytes | None:
@@ -843,6 +860,7 @@ async def music_effects(addr: str, source: str, fps: float, effects: list[str], 
             await start(pos)
             if speed is not None:
                 await w(cmd_speed(speed))
+            stream = Stream(client)
             print(f"music + effect, listening to {dev} - Ctrl-C to stop", file=sys.stderr)
             loop = asyncio.get_running_loop()
             t0 = last_switch = loop.time()
@@ -858,7 +876,7 @@ async def music_effects(addr: str, source: str, fps: float, effects: list[str], 
                     await start(pos)
                 v = round(floor + (100 - floor) * x)
                 if v != last_v:
-                    await w(cmd_brightness(v), ack=False)  # unacked stream, like the music frames
+                    await stream.send(cmd_brightness(v))
                     last_v = v
                 if verbose:
                     print(f"{d:6.1f} dB  level {x:4.2f}  brightness {v:3d}", file=sys.stderr)
@@ -888,10 +906,12 @@ async def music(addr: str, source: str, react: str | None, fps: float, palette: 
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     mic = MicReact() if react == "mic" else None
     idx, frames = 0, 0
+    stream = None
     try:
         async with BleakClient(addr, timeout=15) as client:
             await asyncio.sleep(0.3)
             await client.write_gatt_char(WRITE_CHAR, cmd_power(True), response=True)
+            stream = Stream(client)
             print(f"music mode ({react} style) listening to {dev} at {fps:g} frames/s - Ctrl-C to stop",
                   file=sys.stderr)
             loop = asyncio.get_running_loop()
@@ -914,8 +934,7 @@ async def music(addr: str, source: str, react: str | None, fps: float, palette: 
                     rgb = palette[idx]
                 else:
                     rgb = (0, 0, 0)
-                # unacknowledged: 10+ frames/s is more than acked writes can carry; a lost frame is replaced next tick
-                await client.write_gatt_char(WRITE_CHAR, cmd_music(*rgb, order=order), response=False)
+                await stream.send(cmd_music(*rgb, order=order))
                 frames += 1
                 if verbose:
                     bar = "#" * max(0, min(40, int((d - 20) / 2))) if d > -1e9 else ""
@@ -932,6 +951,232 @@ async def music(addr: str, source: str, react: str | None, fps: float, palette: 
             await proc.wait()
         if verbose:
             print(f"{frames} music frames sent", file=sys.stderr)
+
+
+# ---------- screen sync: the strip glows with the colour of what's on screen ----------
+
+SCREEN_W, SCREEN_H = 48, 27  # GStreamer shrinks every frame to this before Python looks at it
+TOKEN_FILE = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+                          "lightctl", "screencast-token")
+
+
+class ScreenCapture:
+    """Screen frames on Wayland/X11 through xdg-desktop-portal ScreenCast + PipeWire.
+
+    The first run shows the desktop's "share your screen" picker; the permission is saved as a
+    restore token so later runs start without asking. GStreamer decodes the PipeWire stream and
+    scales it to SCREEN_W x SCREEN_H RGB frames on stdout.
+    """
+
+    PORTAL = "org.freedesktop.portal.Desktop"
+    PATH = "/org/freedesktop/portal/desktop"
+    IFACE = "org.freedesktop.portal.ScreenCast"
+
+    def __init__(self, fps: float, verbose: bool = False) -> None:
+        self.fps, self.verbose = fps, verbose
+        self.bus = self.session = self.proc = None
+
+    async def _call(self, member: str, signature: str, body: list, interface: str | None = None):
+        from dbus_fast import Message, MessageType
+        reply = await self.bus.call(Message(destination=self.PORTAL, path=self.PATH,
+                                            interface=interface or self.IFACE, member=member,
+                                            signature=signature, body=body))
+        if reply.message_type == MessageType.ERROR:
+            raise SystemExit(f"lightctl: screen-cast portal {member} failed: {reply.error_name} {reply.body}")
+        return reply
+
+    async def _request(self, member: str, signature: str, body: list, options: dict) -> dict:
+        """Portal calls answer through a Request object's Response signal."""
+        from dbus_fast import Message, MessageType, Variant
+        token = f"lightctl{random.randrange(1 << 30)}"
+        sender = self.bus.unique_name[1:].replace(".", "_")
+        path = f"/org/freedesktop/portal/desktop/request/{sender}/{token}"
+        fut = asyncio.get_running_loop().create_future()
+
+        def on_msg(msg) -> None:
+            if (msg.message_type == MessageType.SIGNAL and msg.path == path
+                    and msg.member == "Response" and not fut.done()):
+                fut.set_result(msg.body)
+
+        self.bus.add_message_handler(on_msg)
+        await self.bus.call(Message(destination="org.freedesktop.DBus", path="/org/freedesktop/DBus",
+                                    interface="org.freedesktop.DBus", member="AddMatch", signature="s",
+                                    body=[f"type='signal',interface='org.freedesktop.portal.Request',"
+                                          f"member='Response',path='{path}'"]))
+        options = {**options, "handle_token": Variant("s", token)}
+        await self._call(member, signature, [*body, options])
+        try:
+            code, results = await fut
+        finally:
+            self.bus.remove_message_handler(on_msg)
+        if code != 0:
+            raise SystemExit(f"lightctl: screen sharing was {'cancelled' if code == 1 else 'refused'} "
+                             f"({member}, code {code})")
+        return {k: v.value for k, v in results.items()}
+
+    async def __aenter__(self) -> "ScreenCapture":
+        from dbus_fast import BusType, Variant
+        from dbus_fast.aio import MessageBus
+        self.bus = await MessageBus(bus_type=BusType.SESSION, negotiate_unix_fd=True).connect()
+        res = await self._request("CreateSession", "a{sv}", [],
+                                  {"session_handle_token": Variant("s", f"lightctl{random.randrange(1 << 30)}")})
+        self.session = res["session_handle"]
+        opts = {"types": Variant("u", 1),          # monitors
+                "multiple": Variant("b", False),
+                "cursor_mode": Variant("u", 1),    # hidden
+                "persist_mode": Variant("u", 2)}   # remember until revoked
+        try:
+            with open(TOKEN_FILE) as f:
+                opts["restore_token"] = Variant("s", f.read().strip())
+        except OSError:
+            print("Your desktop will ask which screen to share: pick the monitor the strip is behind.",
+                  file=sys.stderr)
+        await self._request("SelectSources", "oa{sv}", [self.session], opts)
+        res = await self._request("Start", "osa{sv}", [self.session, ""], {})
+        if res.get("restore_token"):
+            os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
+            fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(res["restore_token"])
+        node = res["streams"][0][0]
+        reply = await self._call("OpenPipeWireRemote", "oa{sv}", [self.session, {}])
+        idx = reply.body[0]
+        fd = reply.unix_fds[idx] if idx < len(reply.unix_fds) else idx
+        self.proc = await asyncio.create_subprocess_exec(
+            "gst-launch-1.0", "-q",
+            "pipewiresrc", f"fd={fd}", f"path={node}", "always-copy=true", "do-timestamp=true", "!",
+            # ask the compositor for at most fps frames (saves CPU), and enforce it with videorate
+            f"video/x-raw,max-framerate={max(1, round(self.fps))}/1", "!",
+            "videorate", "drop-only=true", f"max-rate={max(1, round(self.fps))}", "!",
+            "videoscale", "add-borders=false", "!", "videoconvert", "!",
+            f"video/x-raw,format=RGB,width={SCREEN_W},height={SCREEN_H}", "!",
+            "fdsink", "fd=1", "sync=false",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, pass_fds=(fd,))
+        os.close(fd)
+        return self
+
+    async def frame(self) -> bytes:
+        try:
+            return await self.proc.stdout.readexactly(SCREEN_W * SCREEN_H * 3)
+        except asyncio.IncompleteReadError:
+            err = (await self.proc.stderr.read()).decode(errors="replace").strip()
+            raise SystemExit(f"lightctl: screen capture stopped: {err or 'gst-launch exited'}") from None
+
+    async def __aexit__(self, *exc) -> None:
+        if self.proc is not None and self.proc.returncode is None:
+            self.proc.terminate()
+            await self.proc.wait()
+        if self.session is not None:
+            from dbus_fast import Message
+            try:
+                await self.bus.call(Message(destination=self.PORTAL, path=self.session,
+                                            interface="org.freedesktop.portal.Session", member="Close"))
+            except Exception:  # noqa: BLE001 - best effort on the way out
+                pass
+        if self.bus is not None:
+            self.bus.disconnect()
+
+
+_LINEAR = [(i / 255 / 12.92) if i / 255 <= 0.04045 else ((i / 255 + 0.055) / 1.055) ** 2.4 for i in range(256)]
+
+
+def _srgb(x: float) -> float:
+    x = min(1.0, max(0.0, x))
+    return 12.92 * x if x <= 0.0031308 else 1.055 * x ** (1 / 2.4) - 0.055
+
+
+def screen_color(frame: bytes, region: str = "full", saturation: float = 1.3,
+                 floor: int = 5) -> tuple[float, float, float] | None:
+    """One colour for the whole screen, 0-255 floats; None if the frame is entirely black.
+
+    Colours are mixed in linear light. Each pixel counts by brightness x colourfulness, so vivid
+    areas lead and black bars or dark UI don't wash the result out. How bright the strip glows follows
+    the screen's average brightness (each pixel's strongest channel, so a vivid red screen counts as
+    bright), never below `floor` %; `saturation` makes the colour a bit punchier.
+    """
+    w, h = SCREEN_W, SCREEN_H
+    band = max(1, round(min(w, h) * 0.2))
+    sr = sg = sb = sw = vsum = 0.0
+    n = 0
+    for y in range(h):
+        edge_row = y < band or y >= h - band
+        base = y * w * 3
+        for x in range(w):
+            if region == "edges" and not (edge_row or x < band or x >= w - band):
+                continue
+            i = base + x * 3
+            r, g, b = frame[i], frame[i + 1], frame[i + 2]
+            mx = max(r, g, b)
+            n += 1
+            if mx == 0:
+                continue
+            lr, lg, lb = _LINEAR[r], _LINEAR[g], _LINEAR[b]
+            vsum += mx / 255
+            wgt = (mx / 255) * (0.15 + (mx - min(r, g, b)) / mx)
+            sr += lr * wgt
+            sg += lg * wgt
+            sb += lb * wgt
+            sw += wgt
+    if sw == 0:
+        return None
+    lr, lg, lb = sr / sw, sg / sw, sb / sw
+    peak = max(lr, lg, lb) or 1.0
+    hue, sat, _ = colorsys.rgb_to_hsv(_srgb(lr / peak), _srgb(lg / peak), _srgb(lb / peak))
+    level = min(1.0, vsum / n * 1.25)  # average brightness of the screen, a little lifted
+    value = (floor + (100 - floor) * level) / 100
+    r, g, b = colorsys.hsv_to_rgb(hue, min(1.0, sat * saturation), value)
+    return r * 255, g * 255, b * 255
+
+
+async def screen_sync(addr: str, fps: float, smooth: float, region: str, saturation: float,
+                      floor: int, order: str, duration: float, verbose: bool) -> None:
+    """Capture -> one colour per frame -> smooth fade at `fps` -> unacknowledged colour frames."""
+    target: list[float] | None = None
+    async with ScreenCapture(fps, verbose) as cap, BleakClient(addr, timeout=15) as client:
+        await asyncio.sleep(0.3)
+        await client.write_gatt_char(WRITE_CHAR, cmd_power(True), response=True)
+        await client.write_gatt_char(WRITE_CHAR, cmd_brightness(100, 0x01), response=True)
+        stream = Stream(client)
+        print(f"screen sync at {fps:g} updates/s, fade {smooth:g}s - Ctrl-C to stop", file=sys.stderr)
+
+        async def reader() -> None:
+            nonlocal target
+            while True:
+                c = screen_color(await cap.frame(), region, saturation, floor)
+                if c is not None:
+                    target = list(c)
+                elif target is not None:  # black screen: keep the hue, drop to the floor
+                    peak = max(target) or 1.0
+                    target = [v / peak * 255 * floor / 100 for v in target]
+
+        task = asyncio.create_task(reader())
+        loop = asyncio.get_running_loop()
+        t0 = loop.time()
+        alpha = 1 - math.exp(-1 / (fps * smooth)) if smooth > 0 else 1.0
+        cur: list[float] | None = None
+        last: tuple[int, int, int] | None = None
+        frames = 0
+        try:
+            while not duration or loop.time() - t0 < duration:
+                tick = loop.time()
+                if task.done():
+                    task.result()  # re-raise capture errors
+                if target is not None:
+                    cur = list(target) if cur is None else [c + (t - c) * alpha for c, t in zip(cur, target)]
+                    out = tuple(max(0, min(255, round(v))) for v in cur)
+                    if out != last:
+                        await stream.send(cmd_color(*out, order=order))
+                        last = out
+                        frames += 1
+                        if verbose:
+                            print(f"{'%02x%02x%02x' % out}", file=sys.stderr)
+                await asyncio.sleep(max(0.0, 1 / fps - (loop.time() - tick)))  # time spent sending counts
+        except asyncio.CancelledError:
+            pass
+        finally:
+            task.cancel()
+            if verbose:
+                print(f"{frames} colour updates sent", file=sys.stderr)
 
 
 # ---------- host-driven animations (laptop streams colours over one connection) ----------
@@ -995,6 +1240,7 @@ async def animate(addr: str, name: str, duration: float, period: float | None,
         loop = asyncio.get_running_loop()
         t0 = loop.time()
         frames, last = 0, None
+        stream = Stream(client, barrier=4 if fast else 1)
         print(f"animating {name!r} (period {period}s) - Ctrl-C to stop", file=sys.stderr)
         try:
             while True:
@@ -1003,9 +1249,7 @@ async def animate(addr: str, name: str, duration: float, period: float | None,
                     break
                 rgb = fn(now, period, base)
                 if rgb != last:
-                    pkt = cmd_color(*rgb, order=order)
-                    # --fast: unacknowledged frames (much higher rate; a dropped frame is overwritten by the next)
-                    await client.write_gatt_char(WRITE_CHAR, pkt, response=not fast)
+                    await stream.send(cmd_color(*rgb, order=order))
                     last = rgb
                     frames += 1
                 nxt = t0 + (int(now * fps) + 1) / fps
@@ -1029,6 +1273,7 @@ def main() -> None:
                "  lightctl --music                            # react to what the laptop is playing\n"
                "  lightctl --music mic                        # react to the laptop microphone\n"
                "  lightctl --music --effect random --switch beat   # animations pulsing with the music\n"
+               "  lightctl --screen                           # glow with the colour of the screen\n"
                "  lightctl --animate rainbow\n"
                "  lightctl --timer-on 07:30 --days weekdays --timer-off 23:00\n"
                "  lightctl --power off",
@@ -1062,7 +1307,7 @@ def main() -> None:
     m.add_argument("--switch", metavar="SECONDS|beat",
                    help="with --effect: move to the next effect every N seconds, or on strong beats")
     m.add_argument("--floor", type=parse_pct, default=5, metavar="0-100",
-                   help="with --effect: brightness between beats (default 5)")
+                   help="lowest brightness: between beats with --effect, in dark scenes with --screen (default 5)")
     m.add_argument("--react", choices=["music", "mic"], default="music",
                    help="music (default) = app's Music tab: crazy-fast, a new colour every frame unless "
                         "quiet; mic = app's phone-mic mode: calmer, flashes only on sounds 5 dB above the room")
@@ -1075,16 +1320,29 @@ def main() -> None:
     m.add_argument("--mic-style", choices=list(MIC_STYLES), help="controller mic effect style")
     m.add_argument("--mic-sens", type=parse_pct, metavar="0-100", help="controller mic sensitivity")
 
+    sc = p.add_argument_group("screen sync (the strip glows with what's on screen)")
+    sc.add_argument("--screen", action="store_true",
+                    help="match the strip to the screen's colour (first run asks which monitor to share)")
+    sc.add_argument("--smooth", type=float, default=0.12, metavar="SECONDS",
+                    help="fade time constant between colours (default 0.12; 0 = instant)")
+    sc.add_argument("--saturation", type=float, default=1.3,
+                    help="colour boost, 1.0 = as on screen (default 1.3)")
+    sc.add_argument("--region", choices=["full", "edges"], default="full",
+                    help="sample the whole screen (default) or only its outer edges")
+    sc.add_argument("--screen-reset", action="store_true",
+                    help="forget the shared-monitor choice so the next --screen asks again")
+
     a_ = p.add_argument_group("laptop-driven animation")
     a_.add_argument("--animate", "-a", choices=list(ANIMATIONS),
                     help="stream an animation; --color sets the base colour for breathe")
     a_.add_argument("--duration", "-d", type=float, default=0,
-                    help="seconds to run --animate / --music / --tour (default: until Ctrl-C)")
+                    help="seconds to run --animate / --music / --screen / --tour (default: until Ctrl-C)")
     a_.add_argument("--period", type=float, help="seconds per animation cycle")
     a_.add_argument("--fps", type=float,
-                    help="frames per second (default: 20 for --animate, 10 for --music like the app)")
+                    help="updates per second (default: 20 for --animate, 12 for --screen, 10 for --music like "
+                         "the app). The Bluetooth link carries about 13/s; faster just drops frames")
     a_.add_argument("--fast", action="store_true",
-                    help="--animate: don't wait for acks (about 20 fps instead of 6; may drop a frame)")
+                    help="--animate: mostly unacknowledged writes (about 13 updates/s instead of 6)")
 
     s = p.add_argument_group("settings stored on the controller")
     s.add_argument("--set-wiring", type=parse_order, metavar="ORDER",
@@ -1128,6 +1386,20 @@ def main() -> None:
     if a.animate:
         run(animate(a.addr, a.animate, a.duration, a.period, a.color, a.order,
                     a.fps or 20, a.verbose, a.fast))
+        return
+    if a.screen_reset:
+        try:
+            os.remove(TOKEN_FILE)
+            print("forgot the shared monitor; the next --screen will ask again")
+        except FileNotFoundError:
+            print("nothing to forget")
+        if not a.screen:
+            return
+    if a.screen:
+        if a.smooth < 0 or a.saturation < 0:
+            p.error("--smooth and --saturation must not be negative")
+        run(screen_sync(a.addr, a.fps or 12, a.smooth, a.region, a.saturation, a.floor, a.order,
+                        a.duration, a.verbose))
         return
     if a.music and a.effect:
         for spec in a.effect:  # validate names before connecting

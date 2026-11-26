@@ -14,6 +14,8 @@ and [bleak](https://github.com/hbldh/bleak).
   plus `--tour` to browse them
 - **Music mode**: the app's crazy-fast beat strobe, or built-in animations pulsing with the music,
   driven by whatever the laptop is playing or by any microphone (built-in, USB webcam, …)
+- **Screen sync**: the strip glows with the colour of what's on your monitor, with smooth fades
+  (Wayland/KDE via the desktop's screen-sharing portal)
 - The controller's own microphone mode (style, sensitivity)
 - On/off timers and clock, read back from the controller
 - Settings stored on the controller: wiring order, number of LEDs
@@ -33,7 +35,8 @@ ln -sf "$PWD/lightctl.py" ~/.local/bin/lightctl
 
 The shebang in `lightctl.py` points at `~/projects/strip-light-cli/.venv/bin/python`.
 If you clone somewhere else, edit that first line to your venv's Python.
-Music mode needs PulseAudio or PipeWire (`parec`, `pactl`).
+Music mode needs PulseAudio or PipeWire (`parec`, `pactl`). Screen sync needs
+`xdg-desktop-portal` and GStreamer with its PipeWire plugin (`gst-launch-1.0`, `pipewiresrc`).
 
 Find your strip and set its address (or edit `DEFAULT_ADDR` in the script):
 
@@ -73,6 +76,12 @@ lightctl --music --fps 20                     # even faster than the app (10/s)
 lightctl --music --effect 7-color-running
 lightctl --music --effect random --switch beat          # new animation on strong beats
 lightctl --music mic --effect flow:1 water:1 --switch 8 # rotate a playlist every 8 s
+
+# screen sync (strip behind the monitor)
+lightctl --screen                             # first run asks which monitor to share
+lightctl --screen --smooth 0.3 --saturation 1.5   # slower fades, punchier colours
+lightctl --screen --region edges --floor 0    # only the screen edges; off in dark scenes
+lightctl --screen-reset                       # pick a different monitor next time
 
 # the controller's own microphone
 lightctl --mic on --mic-style spectrum --mic-sens 70
@@ -117,11 +126,34 @@ changes to the next effect on a strong beat (at most once a second), and
 Not usable for music: the controller's own mic mode (`--mic on`) did not respond to sound
 on the tested unit, and changing its sensitivity in real time did not animate it.
 
+## Screen sync
+
+`--screen` asks the desktop for a screen-cast through `xdg-desktop-portal` (KDE shows its
+"share your screen" picker the first time). The permission is saved in
+`~/.config/lightctl/screencast-token`, so later runs start straight away. While it runs, KDE
+shows its usual screen-sharing indicator.
+
+GStreamer receives the PipeWire stream at up to 12 frames/s, shrinks each frame to 48×27
+and hands it to Python. The colour is a weighted mix in linear light: vivid, bright pixels
+count most, black bars and dark UI hardly count. The strip's brightness follows how bright
+the screen is (never below `--floor`), and the colour fades over `--smooth` seconds.
+On the tested laptop this used about 7 % of one CPU core for GStreamer plus about 2 ms of
+Python per frame.
+
+The strip shows one colour at a time (the controller has no per-LED command), so this is a
+single-zone glow, not separate colours per edge.
+
 ## Protocol
 
 GATT service `fff0`, write characteristic `fff3`. Each command is 9 bytes,
 `7e <len> <cmd> … ef`, written **with response** (unacknowledged writes were
-silently dropped). Streams (music, animations) use unacknowledged writes for speed.
+silently dropped).
+
+Streams (music, screen, animations) are limited by the link: the strip uses a ~75 ms
+connection interval, so only **about 13 writes/s** get through. Unacknowledged writes queue
+up instantly, and streaming faster than the link makes the strip lag further and further
+behind. Streams therefore acknowledge every 4th write, which drains the queue and keeps
+latency at a few frames.
 
 | Action          | Frame                                   | Notes                                       |
 |-----------------|-----------------------------------------|---------------------------------------------|

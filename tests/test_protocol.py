@@ -122,5 +122,54 @@ class MusicLogic(unittest.TestCase):
         self.assertAlmostEqual(L.level_db(array.array("h", [1000, -1000] * 50).tobytes()), 60.0)
 
 
+class Screen(unittest.TestCase):
+    @staticmethod
+    def frame(fill, bars=0):
+        w, h = L.SCREEN_W, L.SCREEN_H
+        out = bytearray()
+        for y in range(h):
+            px = (0, 0, 0) if y < bars or y >= h - bars else fill
+            out += bytes(px) * w
+        return bytes(out)
+
+    def test_black_screen(self):
+        self.assertIsNone(L.screen_color(self.frame((0, 0, 0))))
+
+    def test_vivid_colours_full_brightness(self):
+        for fill in ((255, 0, 0), (0, 255, 0), (0, 0, 255)):
+            out = L.screen_color(self.frame(fill), saturation=1.0, floor=0)
+            self.assertEqual(tuple(round(v) for v in out), fill)
+
+    def test_letterbox_keeps_hue(self):
+        r, g, b = L.screen_color(self.frame((0, 0, 255), bars=6), saturation=1.0, floor=0)
+        self.assertGreater(b, 150)
+        self.assertLess(max(r, g), 5)
+
+    def test_dark_scene_dims_to_floor(self):
+        r, g, b = L.screen_color(self.frame((20, 20, 20)), floor=5)
+        self.assertLess(max(r, g, b), 40)
+
+
+class StreamWriter(unittest.TestCase):
+    def test_every_fourth_write_is_acknowledged(self):
+        import asyncio
+
+        class Fake:
+            def __init__(self):
+                self.acks = []
+
+            async def write_gatt_char(self, char, data, response):
+                self.acks.append(response)
+
+        fake = Fake()
+        s = L.Stream(fake, barrier=4)
+
+        async def go():
+            for _ in range(8):
+                await s.send(b"x")
+        asyncio.run(go())
+        self.assertEqual(fake.acks, [False, False, False, True] * 2)
+
+
 if __name__ == "__main__":
     unittest.main()
