@@ -42,9 +42,12 @@ import sys
 import time
 
 from bleak import BleakClient, BleakScanner
+from bleak.backends.device import BLEDevice
 
 
 IS_WINDOWS = sys.platform == "win32"
+NO_LE_DEVICES = ("no Bluetooth LE device was heard at all - this computer's Bluetooth adapter may be unable to "
+                 "scan for Bluetooth LE devices; see README, 'Bluetooth adapters'")
 
 
 def log(msg: str, err: bool = True) -> None:
@@ -721,13 +724,17 @@ class Group:
             self.clients.pop(d, None)
         return gone
 
+    SCAN_TIMEOUT = 10.0
+
     async def _find_and_connect(self, devices: list[Device]) -> None:
         want = {d.addr for d in devices}
         found: dict[str, object] = {}
+        heard: set[str] = set()  # every Bluetooth LE device the scan heard, strip or not
         all_found = asyncio.Event()
 
         def seen(dev, adv) -> None:
             a = dev.address.upper()
+            heard.add(a)
             if a in want and a not in found:
                 found[a] = dev
                 if len(found) == len(want):
@@ -735,15 +742,22 @@ class Group:
 
         async with BleakScanner(detection_callback=seen):  # one scan finds every strip
             try:
-                await asyncio.wait_for(all_found.wait(), timeout=10)
+                await asyncio.wait_for(all_found.wait(), timeout=self.SCAN_TIMEOUT)
             except asyncio.TimeoutError:
                 pass
+        targets = {d: found[d.addr] for d in devices if d.addr in found}
+        if IS_WINDOWS:
+            # Windows can also connect straight from the address to a strip it has seen before. That
+            # rescues Bluetooth adapters whose LE scanning hears nothing (e.g. Actions ATS2851 dongles).
+            targets.update({d: BLEDevice(d.addr, d.name, None) for d in devices if d not in targets})
+        await asyncio.gather(*(self._connect(d, dev, retries=3 if d.addr in found else 1, quiet=d.addr not in found)
+                               for d, dev in targets.items()))
         for d in devices:
-            if d.addr not in found:
-                self._warn(d, "not found (switched off, out of range, or connected to the phone app?)")
-        await asyncio.gather(*(self._connect(d, found[d.addr]) for d in devices if d.addr in found))
+            if d not in self.clients and d.addr not in found:
+                self._warn(d, "not found (" + ("switched off, out of range, or connected to the phone app "
+                                               "or another computer?" if heard else NO_LE_DEVICES) + ")")
 
-    async def _connect(self, d: Device, ble_device, retries: int = 3) -> None:
+    async def _connect(self, d: Device, ble_device, retries: int = 3, quiet: bool = False) -> None:
         last: Exception | None = None
         for attempt in range(retries):
             client = BleakClient(ble_device, timeout=15)
@@ -755,8 +769,10 @@ class Group:
                 last = e
                 if self.verbose:
                     self._warn(d, f"connect attempt {attempt + 1} failed: {e}")
-                await asyncio.sleep(0.5 + attempt)
-        self._warn(d, f"could not connect: {last}")
+                if attempt + 1 < retries:
+                    await asyncio.sleep(0.5 + attempt)
+        if not quiet:  # quiet: a try without a scan result; the caller reports "not found"
+            self._warn(d, f"could not connect: {last}")
 
     async def __aexit__(self, *exc) -> None:
         await asyncio.gather(*(c.disconnect() for c in self.clients.values()), return_exceptions=True)
@@ -908,8 +924,12 @@ async def scan(seconds: float) -> None:
     found = await BleakScanner.discover(timeout=seconds, return_adv=True)
     hits = [(d, adv) for d, adv in found.values()
             if (d.name or "").upper().startswith(NAME_PREFIXES)]
+    if not found:
+        print(f"No Bluetooth LE devices found at all: {NO_LE_DEVICES.split(' - ', 1)[1]}.")
+        return
     if not hits:
-        print("No ELK/MELK-style devices found. Is the phone app still connected to it?")
+        print(f"No ELK/MELK-style devices among the {len(found)} Bluetooth LE devices found. Is a strip switched "
+              "off, out of range, or connected to the phone app or another computer?")
         return
     saved = {d.addr: d.name for d in load_devices().values()}
     for d, adv in sorted(hits, key=lambda x: -x[1].rssi):

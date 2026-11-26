@@ -191,6 +191,85 @@ class WindowsBackends(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(import_threads[0], com_threads)  # not on the thread that set COM up
 
 
+class FakeScanner:
+    """A Bluetooth scan that hears the given (address, name) pairs as soon as it starts."""
+    heard: list = []
+
+    def __init__(self, detection_callback):
+        self.callback = detection_callback
+
+    async def __aenter__(self):
+        for addr, name in self.heard:
+            self.callback(types.SimpleNamespace(address=addr, name=name, details="scan record"), None)
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class FakeBleakClient:
+    """Connects to scanned strips; to one given only by address (no scan record) only if Windows knows it."""
+    known: set = set()
+    made: list = []
+
+    def __init__(self, device, timeout):
+        self.device, self.is_connected = device, False
+        FakeBleakClient.made.append(device)
+
+    async def connect(self):
+        if self.device.details is None and self.device.address not in self.known:
+            raise RuntimeError(f"Device with address {self.device.address} was not found.")
+        self.is_connected = True
+
+    async def disconnect(self):
+        self.is_connected = False
+
+
+class FindingStrips(unittest.IsolatedAsyncioTestCase):
+    """Some USB Bluetooth dongles (Actions ATS2851) hear no LE advertisements at all on Windows,
+    yet Windows can still connect to a strip it has seen before, straight from its address."""
+    MON = L.Device("monitor", "BE:69:32:13:B6:00", "rgb")
+    ROOM = L.Device("room", "BE:69:04:14:32:04", "rgb")
+
+    def setUp(self):
+        self.saved = (L.BleakScanner, L.BleakClient, L.IS_WINDOWS, L.log, L.Group.SCAN_TIMEOUT)
+        L.BleakScanner, L.BleakClient, L.Group.SCAN_TIMEOUT = FakeScanner, FakeBleakClient, 0.2
+        self.warnings: list[str] = []
+        L.log = lambda msg, err=True: self.warnings.append(msg)
+        FakeBleakClient.made = []
+
+    def tearDown(self):
+        L.BleakScanner, L.BleakClient, L.IS_WINDOWS, L.log, L.Group.SCAN_TIMEOUT = self.saved
+
+    async def connect(self, windows: bool, heard: list, known: set) -> L.Group:
+        L.IS_WINDOWS = windows
+        FakeScanner.heard, FakeBleakClient.known = heard, known
+        g = L.Group([self.MON, self.ROOM])
+        await g._find_and_connect(g.devices)
+        return g
+
+    async def test_windows_reaches_a_known_strip_when_the_scan_hears_nothing(self):
+        g = await self.connect(True, heard=[], known={self.ROOM.addr})
+        self.assertEqual(g.live, [self.ROOM])
+        self.assertIsNone(g.clients[self.ROOM].device.details)  # straight from the address
+        self.assertEqual(len(self.warnings), 1)
+        self.assertIn("monitor: not found (no Bluetooth LE device was heard at all", self.warnings[0])
+
+    async def test_scanned_strips_are_used_as_found(self):
+        g = await self.connect(True, heard=[(self.MON.addr, "MELK-OA10 22"), ("11:22:33:44:55:66", "phone")],
+                               known=set())
+        self.assertEqual(g.live, [self.MON])
+        self.assertEqual(g.clients[self.MON].device.details, "scan record")
+        self.assertEqual(len(self.warnings), 1)  # the room strip: not heard, and Windows never saw it
+        self.assertIn("room: not found (switched off, out of range", self.warnings[0])
+
+    async def test_linux_only_connects_to_scanned_strips(self):
+        g = await self.connect(False, heard=[], known={self.ROOM.addr})
+        self.assertEqual(g.live, [])
+        self.assertEqual(FakeBleakClient.made, [])  # BlueZ needs the scan record to connect
+        self.assertEqual(len(self.warnings), 2)
+
+
 @unittest.skipUnless(HAVE_DEPS, "needs numpy and Pillow")
 class WindowsUI(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
