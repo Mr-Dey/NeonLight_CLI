@@ -14,7 +14,9 @@ and several strips at once, in a command line and an interactive terminal UI.
 
 Developed on Garuda Linux (KDE Wayland, PipeWire) with Python 3.14 and
 [bleak](https://github.com/hbldh/bleak). The Windows back-ends are covered by tests with
-stand-ins for the Windows libraries; real-hardware testing on Windows is under way.
+stand-ins for the Windows libraries. On a real Windows 11 PC the tests pass and audio capture
+works. Bluetooth hasn't been tested there yet, because that PC's USB dongle can't scan for LE
+devices (see [Bluetooth adapters](#bluetooth-adapters)).
 
 ## Features
 
@@ -104,11 +106,32 @@ Windows Bluetooth settings.
 `lightctl` from anywhere, add the project folder to your user PATH (Settings → System → About →
 Advanced system settings → Environment Variables → Path → New).
 
+### Bluetooth adapters
+
+The strips are Bluetooth Low Energy (LE) devices, so the computer's Bluetooth adapter has to be
+able to scan for LE devices. Some cheap "Bluetooth 5.3" USB dongles can't do that on Windows: they
+play audio fine but hear no LE device at all, and `lightctl --scan` says it found no Bluetooth LE
+devices at all. One such dongle uses an **Actions ATS2851** chip (USB ID `10D7:B012`, listed as
+"Generic Bluetooth Adapter"). Windows won't connect to an LE device it has never heard, so the
+strips can't be reached through such a dongle.
+
+To see which adapter you have:
+
+```powershell
+Get-PnpDevice -Class Bluetooth -PresentOnly | Where-Object InstanceId -like 'USB*' | Select-Object FriendlyName, InstanceId
+```
+
+`VID_10D7&PID_B012` in the InstanceId is the ATS2851. Use an adapter with a Realtek, Intel or
+similar chip instead: for example a Realtek RTL8761B dongle such as the TP-Link UB500, or the
+Bluetooth built into many laptops and Wi-Fi cards. Unplug the old dongle (Windows uses one
+Bluetooth adapter at a time), then pair your Bluetooth speakers or headphones again.
+
 ### Windows test checklist
 
 Run these from the project folder and note what happens (copy any error text):
 
 ```powershell
+.\lightctl --scan                             # both strips found (see Bluetooth adapters if not)
 .\lightctl --devices                          # both strips listed
 .\lightctl -v --color red                     # both strips red
 .\lightctl --mode yellow-marquee --speed 60   # both strips yellow, moving

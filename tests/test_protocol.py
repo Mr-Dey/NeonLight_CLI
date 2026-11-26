@@ -6,6 +6,7 @@ Run:  .venv/bin/python -m unittest -v
 """
 import asyncio
 import datetime as dt
+import types
 import unittest
 
 import lightctl as L
@@ -288,6 +289,67 @@ class Feed(unittest.TestCase):
         # slow link: one write per 0.10 / 2 / 0.8 = 62.5 ms (plus its acknowledged ones) in 1.5 s
         self.assertTrue(15 <= counts["slow"] <= 30, counts)
         self.assertGreater(counts["fast"], 3 * counts["slow"])
+
+
+class FakeScanner:
+    """A Bluetooth scan that hears the given (address, name) pairs as soon as it starts."""
+    heard: list = []
+
+    def __init__(self, detection_callback):
+        self.callback = detection_callback
+
+    async def __aenter__(self):
+        for addr, name in self.heard:
+            self.callback(types.SimpleNamespace(address=addr, name=name), None)
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class FakeBleakClient(FakeClient):
+    def __init__(self, device, timeout):
+        super().__init__()
+        self.device, self.is_connected = device, False
+
+    async def connect(self):
+        self.is_connected = True
+
+
+class FindingStrips(unittest.IsolatedAsyncioTestCase):
+    MON = L.Device("monitor", "BE:69:32:13:B6:00", "rgb")
+    ROOM = L.Device("room", "BE:69:04:14:32:04", "rgb")
+
+    def setUp(self):
+        self.saved = (L.BleakScanner, L.BleakClient, L.log, L.Group.SCAN_TIMEOUT)
+        L.BleakScanner, L.BleakClient, L.Group.SCAN_TIMEOUT = FakeScanner, FakeBleakClient, 0.2
+        self.warnings: list[str] = []
+        L.log = lambda msg, err=True: self.warnings.append(msg)
+
+    def tearDown(self):
+        L.BleakScanner, L.BleakClient, L.log, L.Group.SCAN_TIMEOUT = self.saved
+
+    async def connect(self, heard: list) -> L.Group:
+        FakeScanner.heard = heard
+        g = L.Group([self.MON, self.ROOM])
+        await g._find_and_connect(g.devices)
+        return g
+
+    async def test_strips_the_scan_heard_get_connected(self):
+        g = await self.connect([(self.MON.addr, "MELK-OA10 22"), ("11:22:33:44:55:66", "phone")])
+        self.assertEqual(g.live, [self.MON])
+        self.assertEqual(g.clients[self.MON].device.name, "MELK-OA10 22")
+        self.assertEqual(len(self.warnings), 1)
+        self.assertIn("room: not found (switched off, out of range", self.warnings[0])
+
+    async def test_a_scan_that_hears_nothing_points_at_the_adapter(self):
+        # e.g. 'Bluetooth 5.3' USB dongles with an Actions ATS2851 chip, on Windows: no LE device at all
+        g = await self.connect([])
+        self.assertEqual(g.live, [])
+        self.assertEqual(len(self.warnings), 2)
+        for w in self.warnings:
+            self.assertIn("no Bluetooth LE device was heard at all", w)
+            self.assertIn("'Bluetooth adapters'", w)
 
 
 class Devices(unittest.TestCase):

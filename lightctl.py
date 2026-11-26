@@ -42,7 +42,6 @@ import sys
 import time
 
 from bleak import BleakClient, BleakScanner
-from bleak.backends.device import BLEDevice
 
 
 IS_WINDOWS = sys.platform == "win32"
@@ -745,19 +744,13 @@ class Group:
                 await asyncio.wait_for(all_found.wait(), timeout=self.SCAN_TIMEOUT)
             except asyncio.TimeoutError:
                 pass
-        targets = {d: found[d.addr] for d in devices if d.addr in found}
-        if IS_WINDOWS:
-            # Windows can also connect straight from the address to a strip it has seen before. That
-            # rescues Bluetooth adapters whose LE scanning hears nothing (e.g. Actions ATS2851 dongles).
-            targets.update({d: BLEDevice(d.addr, d.name, None) for d in devices if d not in targets})
-        await asyncio.gather(*(self._connect(d, dev, retries=3 if d.addr in found else 1, quiet=d.addr not in found)
-                               for d, dev in targets.items()))
         for d in devices:
-            if d not in self.clients and d.addr not in found:
+            if d.addr not in found:
                 self._warn(d, "not found (" + ("switched off, out of range, or connected to the phone app "
                                                "or another computer?" if heard else NO_LE_DEVICES) + ")")
+        await asyncio.gather(*(self._connect(d, found[d.addr]) for d in devices if d.addr in found))
 
-    async def _connect(self, d: Device, ble_device, retries: int = 3, quiet: bool = False) -> None:
+    async def _connect(self, d: Device, ble_device, retries: int = 3) -> None:
         last: Exception | None = None
         for attempt in range(retries):
             client = BleakClient(ble_device, timeout=15)
@@ -771,8 +764,7 @@ class Group:
                     self._warn(d, f"connect attempt {attempt + 1} failed: {e}")
                 if attempt + 1 < retries:
                     await asyncio.sleep(0.5 + attempt)
-        if not quiet:  # quiet: a try without a scan result; the caller reports "not found"
-            self._warn(d, f"could not connect: {last}")
+        self._warn(d, f"could not connect: {last}")
 
     async def __aexit__(self, *exc) -> None:
         await asyncio.gather(*(c.disconnect() for c in self.clients.values()), return_exceptions=True)

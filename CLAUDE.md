@@ -13,12 +13,22 @@ protocol). This file is for the next Claude session.
 - The Windows support (commit aa47d28) was written on Linux. It was checked only with stand-ins
   for the Windows libraries (tests/test_windows.py) and by resolving the Windows wheels for Python
   3.12-3.14. **No Windows-specific code had run on real Windows before this session.**
-- The user's report from Windows, word for word: "for windows its not working correctly". There
-  are no details yet. Start by asking:
-  - what fails: which command or UI tab, the full output, and what each strip did;
-  - their versions: `winver`, `py --version` and `.venv\Scripts\pip list`.
-
-  Don't guess at a fix before you have those answers.
+- The user's report from Windows was "for windows its not working correctly". What we found on
+  their PC (Windows 11 24H2, global Python 3.14 with no `.venv`, repo at `F:\Git\NeonLight_CLI`):
+  - **Audio: fixed.** soundcard's import calls `CoInitializeEx`. On a thread where COM was
+    already set up, it raised `RuntimeError('Error 0x100000001')`, so music mode and the audio
+    list failed. winbackend now imports soundcard on a fresh thread (`_import_soundcard`). The
+    fix came from the user's agy session and was reproduced and verified on the PC.
+  - **Bluetooth: hardware.** The PC's only Bluetooth radio is a USB dongle with an Actions
+    ATS2851 chip (`VID_10D7&PID_B012`). On Windows it hears no LE advertisements at all; even a
+    raw WinRT `BluetoothLEAdvertisementWatcher` gets nothing, active or passive.
+    - Windows can still connect to an LE device it heard recently. Its cache of unpaired LE
+      devices expires, though, so connecting by address isn't a workaround (tried and dropped).
+    - The user needs a different adapter (README "Bluetooth adapters"). Retest everything with
+      Bluetooth once it's in.
+  - The PC has no saved strips of its own: run `--add-device ... --order rgb` there.
+- Testing over SSH runs in session 0. Bluetooth scanning and screen capture don't work there,
+  so ask the user to run those tests in their own window.
 - One change was made just before the handoff: `DEFAULT_ORDER` is now `rgb`. It was `gbr`, which
   had been stale since the monitor strip's wiring was stored on its controller. Before the change,
   a machine with no saved strips, or a strip added without `--order`, got gbr-ordered colours, so
@@ -29,10 +39,11 @@ protocol). This file is for the next Claude session.
 ## First steps on Windows
 
 1. `git pull`, then `.venv\Scripts\pip install -r requirements.txt` (see README, "Install on
-   Windows"). In Git Bash the paths are `.venv/Scripts/...`.
-2. Run `.venv\Scripts\python -m unittest discover -s tests -v`. All 49 tests use stand-ins and no
-   Bluetooth, and they pass on Linux; they have never run on Windows. A failure here points at the
-   install or environment, not the strips.
+   Windows"). On the user's PC there is no `.venv`: use `python` (global 3.14) instead. In Git
+   Bash the paths are `.venv/Scripts/...`.
+2. Run `python -m unittest discover -s tests -v`. All 52 tests use stand-ins and no Bluetooth,
+   and they pass on Linux and on the user's PC. A failure here points at the install or
+   environment, not the strips.
 3. Close any running lightctl or UI before running commands yourself. A strip that is already
    connected stops advertising, so a second process can't find it.
 4. Work through the README "Windows test checklist" one command at a time, adding `-v` where it
@@ -47,6 +58,8 @@ protocol). This file is for the next Claude session.
 ## Possible Windows problems (unverified: check each against the real symptom first)
 
 Bluetooth (bleak 3.1 on WinRT):
+- **The adapter can't scan LE (confirmed on the user's PC).** `--scan` then reports no Bluetooth
+  LE devices at all. See the handoff notes above and README "Bluetooth adapters".
 - **Strips are only found while advertising.** `Group._find_and_connect` (lightctl.py:724) finds
   strips with one 10 s scan, and a connected strip doesn't advertise. Each of these therefore
   looks like "not found":
