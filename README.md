@@ -118,7 +118,8 @@ lightctl --music mic --effect flow:1 water:1 --switch 8 # rotate a playlist ever
 
 # screen sync (strip behind the monitor)
 lightctl --screen                             # first run asks which monitor to share
-lightctl --screen --smooth 0.3 --saturation 1.5   # slower fades, punchier colours
+lightctl --screen --smooth 0.3 --saturation 3 --gain 1.6   # slower fades, vivid, brighter
+lightctl --screen --fps 30                    # target rate; capped at what the link delivers
 lightctl --screen --region edges --floor 0    # only the screen edges; off in dark scenes
 lightctl --screen-reset                       # pick a different monitor next time
 
@@ -133,7 +134,7 @@ lightctl --timers                             # read both back
 lightctl --sync-clock
 
 # settings stored on the controller
-lightctl --set-wiring gbr                     # the app's "pin sequence" option
+lightctl -D monitor --set-wiring grb          # the app's "pin sequence": strip's real LED order
 lightctl --leds 150                           # number of addressable points (10-1000)
 
 # laptop-driven animations
@@ -207,11 +208,15 @@ GATT service `fff0`, write characteristic `fff3`. Each command is 9 bytes,
 `7e <len> <cmd> … ef`, written **with response** (unacknowledged writes were
 silently dropped).
 
-Streams (music, screen, animations) are limited by the link: the strip uses a ~75 ms
-connection interval, so only **about 13 writes/s** get through. Unacknowledged writes queue
-up instantly, and streaming faster than the link makes the strip lag further and further
-behind. Streams therefore acknowledge every 4th write, which drains the queue and keeps
-latency at a few frames.
+Streams (music, screen, animations) are limited by the link: the strips ask for a ~75-90 ms
+connection interval, so only **about 10-16 writes/s** get through (it varies with the radio
+environment). Unacknowledged writes queue up instantly, and streaming faster than the link
+makes a strip lag further and further behind. So streams write frames unacknowledged and,
+every 5 frames, an acknowledged no-op (a timer query) in the background: its answer comes back
+once the queue has drained. The time between answers is what the link really delivers, and
+streams pace themselves to it (probing 10 % faster), so `--fps 60` simply runs as fast as the
+link allows without building up lag. `tools/linkspeed.py` (run with sudo) shows the negotiated
+interval and tries a faster one.
 
 | Action          | Frame                                   | Notes                                       |
 |-----------------|-----------------------------------------|---------------------------------------------|
@@ -236,16 +241,21 @@ Flow, Tail, Run, RunBack), using the app's own ids. The app's 28 "Scenes" are on
 enabled for MELK-OC/OT controllers and one OA10 firmware. They had no effect on the
 tested strip, so they are left out (send them with `--raw` if your model has them).
 
-### Channel order
+### Channel order (wiring)
 
-Strips are wired differently. On the tested strip the colour bytes drive **green,
-blue, red** (`--order gbr`, the default). If colours come out wrong, try the other
-orders, or store the order on the controller with `--set-wiring` (then use `--order rgb`):
+Strips are wired differently, and a controller may already have a wiring stored (the app's
+pin-sequence setting), which changes what you see. The reliable way:
 
 ```bash
-lightctl --order rgb --color red      # or grb, brg, bgr, rbg
-export LIGHTCTL_ORDER=rgb             # make it permanent
+lightctl -D monitor --set-wiring rgb --order rgb --color red   # reset: no re-mapping, plain red
+lightctl -D monitor --order rgb --color red     # note the colour you see, then green, then blue
+lightctl -D monitor --set-wiring grb            # store the real order you found (e.g. G-R-B)
 ```
+
+`--set-wiring` stores the order on the controller (so colours **and** built-in effects are
+right) and saves the strip with `--order rgb`. Without storing, `--order` re-maps colours on
+the laptop side only, and built-in effects stay wrong. One tested strip turned out to be
+`grb` but had "R B G" stored from before, which made it look like `gbr`.
 
 ## Tests
 

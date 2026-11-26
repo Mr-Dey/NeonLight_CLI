@@ -36,6 +36,7 @@ DEFAULTS = {
     "music_style": "animated", "music_source": "system", "music_effect": "random", "music_switch": "beat",
     "music_floor": 5,
     "screen_smooth": 0.12, "screen_saturation": 1.3, "screen_region": "full", "screen_floor": 5,
+    "screen_gain": 1.25, "screen_fps": 12,
     "animation": "rainbow", "anim_period": 6.0,
     "timer_days": "daily",
     "muted": [],
@@ -48,7 +49,9 @@ MUSIC_STYLES = {
 TABS = ["light", "effects", "music", "screen", "anim", "timers", "strips"]
 
 
+SCREEN_RATES = [10, 12, 15, 20, 30, 60]
 CHOICES = {"music_style": list(MUSIC_STYLES), "music_switch": ["beat", "8", "15", "never"],
+           "screen_fps": SCREEN_RATES,
            "screen_region": ["full", "edges"], "animation": list(L.ANIMATIONS),
            "timer_days": ["daily", "weekdays", "weekends"]}
 
@@ -66,7 +69,7 @@ def load_settings() -> dict:
     if s["music_effect"] != "random" and s["music_effect"] not in L.MODES:
         s["music_effect"] = "random"
     for key in ("brightness", "speed", "tour_interval", "music_floor", "screen_smooth",
-                "screen_saturation", "screen_floor", "anim_period"):
+                "screen_saturation", "screen_floor", "screen_gain", "anim_period"):
         if not isinstance(s[key], (int, float)):
             s[key] = DEFAULTS[key]
     if not isinstance(s["muted"], list):
@@ -166,6 +169,7 @@ class LightUI(App):
     #music-source { width: 1fr; }
     #music-effect { width: 1fr; }
     #music-switch { width: 30; }
+    #screen-fps { width: 36; }
     RadioSet { margin: 0 1; width: auto; }
     #timer-view { margin: 1 1; height: auto; }
     .timer-in { width: 12; }
@@ -196,6 +200,8 @@ class LightUI(App):
         self.sent: dict[str, object] = {}
         self.connecting = False
         self._closed = False
+        self.rate: float | None = None  # stream frames per second actually sent while a mode runs
+        self._rate_mark: tuple[float, int] | None = None
 
     # ---------- layout ----------
 
@@ -270,7 +276,15 @@ class LightUI(App):
                         yield Level(s["screen_smooth"], 0, 1, 0.04, "{:.2f}s", id="screen-smooth")
                     with Horizontal(classes="row"):
                         yield Label("Colour boost", classes="lbl")
-                        yield Level(s["screen_saturation"], 0.5, 2.0, 0.1, "{:.1f}x", id="screen-saturation")
+                        yield Level(s["screen_saturation"], 0.5, 4.0, 0.1, "{:.1f}x", id="screen-saturation")
+                    with Horizontal(classes="row"):
+                        yield Label("Brightness boost", classes="lbl")
+                        yield Level(s["screen_gain"], 0.5, 3.0, 0.05, "{:.2f}x", id="screen-gain")
+                    with Horizontal(classes="row"):
+                        yield Label("Update rate", classes="lbl")
+                        yield Select([(f"{r} per second" + (" (default)" if r == 12 else ""), r)
+                                      for r in SCREEN_RATES], value=s["screen_fps"], allow_blank=False,
+                                     id="screen-fps")
                     with Horizontal(classes="row"):
                         yield Label("Dark scenes", classes="lbl")
                         yield Level(s["screen_floor"], 0, 50, 1, id="screen-floor")
@@ -280,6 +294,8 @@ class LightUI(App):
                         yield RadioButton("Edges only", value=s["screen_region"] == "edges", id="sr-edges")
                     yield Label("The first time, KDE asks which screen to share. "
                                 "Tip: switch off strips that aren't behind the monitor in tab 7.", classes="hint")
+                    yield Label("Each strip's Bluetooth link carries about 10-16 updates per second, so higher "
+                                "rates run as fast as the link allows; the top bar shows the real rate.", classes="hint")
             with TabPane("5 Animations", id="anim"):
                 with VerticalScroll():
                     with Horizontal(classes="row"):
@@ -366,7 +382,8 @@ class LightUI(App):
             else:
                 parts.append(f"[red]●[/] {d.name}" + (" [dim]connecting…[/]" if self.connecting else ""))
         mode = self.MODE_NAMES.get(self.mode_name or "", "")
-        status = "   ".join(parts) + ("   │   [b]" + mode + "[/] running  (x to stop)" if mode else "")
+        rate = f" · {self.rate:.1f} updates/s" if mode and self.rate else ""
+        status = "   ".join(parts) + ("   │   [b]" + mode + "[/] running" + rate + "  (x to stop)" if mode else "")
         with contextlib.suppress(Exception):
             self.query_one("#status", Static).update(status)
             for i, d in enumerate(self.devices):
@@ -394,6 +411,13 @@ class LightUI(App):
     def check_strips(self) -> None:
         for d in self.group.prune():
             self.log_line(f"lightctl: {d.name}: connection lost (press r to reconnect)")
+        now = asyncio.get_running_loop().time()
+        if self.mode_name and self._rate_mark is not None:
+            t0, n0 = self._rate_mark
+            self.rate = (self.group.n - n0) / (now - t0) if now > t0 else None
+        else:
+            self.rate = None
+        self._rate_mark = (now, self.group.n) if self.mode_name else None
         self.refresh_status()
 
     # ---------- helpers ----------
@@ -485,8 +509,9 @@ class LightUI(App):
 
     def screen_job(self):
         s = self.s
-        return lambda: L.screen_sync(self.group, 12, s["screen_smooth"], s["screen_region"],
-                                     s["screen_saturation"], int(s["screen_floor"]), 0, False)
+        return lambda: L.screen_sync(self.group, int(s["screen_fps"]), s["screen_smooth"], s["screen_region"],
+                                     s["screen_saturation"], int(s["screen_floor"]), 0, False,
+                                     s["screen_gain"])
 
     def anim_job(self):
         s = self.s
@@ -693,10 +718,17 @@ class LightUI(App):
     @on(Level.Changed, "#screen-smooth")
     @on(Level.Changed, "#screen-saturation")
     @on(Level.Changed, "#screen-floor")
+    @on(Level.Changed, "#screen-gain")
     def screen_option(self, ev: Level.Changed) -> None:
         key = {"screen-smooth": "screen_smooth", "screen-saturation": "screen_saturation",
-               "screen-floor": "screen_floor"}[ev.level.id]
+               "screen-floor": "screen_floor", "screen-gain": "screen_gain"}[ev.level.id]
         self.save(**{key: round(ev.value, 3)})
+        if self.mode_name == "screen":
+            self.restart_soon("screen")
+
+    @on(Select.Changed, "#screen-fps")
+    def screen_fps(self, ev: Select.Changed) -> None:
+        self.save(screen_fps=int(ev.value))
         if self.mode_name == "screen":
             self.restart_soon("screen")
 

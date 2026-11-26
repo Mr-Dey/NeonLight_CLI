@@ -46,9 +46,14 @@ class Frames(unittest.TestCase):
         self.assertEqual(L.cmd_mic_style(L.MIC_STYLES["rolling"]), java(126, 7, 3, 3 + 128, 4, -1, -1, 0, -17))
         self.assertEqual(L.cmd_mic_sens(50), java(126, 4, 6, 50, -1, -1, -1, 0, -17))
 
-    def test_wiring(self):  # changePinSequence(); app option "G B R" = "120" -> digits + 1
+    def test_wiring(self):  # changePinSequence(); app option "G R B" = "102" -> digits + 1
+        self.assertEqual(L.cmd_wiring("grb"), java(126, 6, -127, 2, 1, 3, -1, 0, -17))  # the monitor strip
         self.assertEqual(L.cmd_wiring("gbr"), java(126, 6, -127, 2, 3, 1, -1, 0, -17))
-        self.assertEqual(L.cmd_wiring("rgb"), java(126, 6, -127, 1, 2, 3, -1, 0, -17))
+        self.assertEqual(L.cmd_wiring("rgb"), java(126, 6, -127, 1, 2, 3, -1, 0, -17))  # no re-mapping
+        for physical in ("rgb", "rbg", "grb", "gbr", "brg", "bgr"):
+            seq = L.cmd_wiring(physical)[3:6]
+            for j in range(3):  # output j (LEDs of colour physical[j]) is fed colour seq[j]
+                self.assertEqual("rgb"[seq[j] - 1], physical[j])
 
     def test_leds(self):  # changeSymphonyPoint()
         self.assertEqual(L.cmd_leds(300), java(126, 7, 33, 300 & 255, 300 >> 8, 0, -1, 0, -17))
@@ -145,6 +150,16 @@ class Screen(unittest.TestCase):
         self.assertGreater(b, 150)
         self.assertLess(max(r, g), 5)
 
+    def test_brightness_gain(self):
+        dim = L.screen_color(self.frame((100, 0, 0)), saturation=1.0, floor=0, gain=1.0)
+        lifted = L.screen_color(self.frame((100, 0, 0)), saturation=1.0, floor=0, gain=2.5)
+        self.assertAlmostEqual(dim[0], 100, delta=2)
+        self.assertGreater(lifted[0], 240)
+
+    def test_colour_boost_saturates(self):
+        r, g, b = L.screen_color(self.frame((200, 150, 150)), saturation=4.0, floor=0, gain=1.0)
+        self.assertLess(min(g, b), 5)  # a pale pink becomes a vivid red
+
     def test_dark_scene_dims_to_floor(self):
         r, g, b = L.screen_color(self.frame((20, 20, 20)), floor=5)
         self.assertLess(max(r, g, b), 40)
@@ -172,15 +187,19 @@ class GroupWrites(unittest.TestCase):
         import asyncio
         asyncio.run(coro)
 
-    def test_every_fourth_stream_write_is_acknowledged(self):
-        g = self.group("gbr")
+    def test_stream_frames_unacked_with_background_noop_ack(self):
+        g = self.group("rgb")
 
         async def go():
-            for _ in range(8):
-                await g.stream(b"x")
+            for i in range(10):
+                await g.stream(bytes([i]), barrier=5)
+            await g.drain()
         self.run_async(go())
-        acks = [r for _, r in next(iter(g.clients.values())).writes]
-        self.assertEqual(acks, [False, False, False, True] * 2)
+        writes = next(iter(g.clients.values())).writes
+        frames = [d for d, ack in writes if not ack]
+        acks = [d for d, ack in writes if ack]
+        self.assertEqual(frames, [bytes([i]) for i in range(10)])    # every frame, in order, unacknowledged
+        self.assertEqual(acks, [L.cmd_timer_query(L.TIMER_ON)] * 2)  # one harmless ack per 5 frames
 
     def test_same_moment_each_strips_own_wiring(self):
         g = self.group("gbr", "rgb")
@@ -188,6 +207,30 @@ class GroupWrites(unittest.TestCase):
         a, b = (c.writes[0][0] for c in g.clients.values())
         self.assertEqual(a[4:7], bytes([0, 0, 255]))   # gbr strip: red is the 3rd byte
         self.assertEqual(b[4:7], bytes([255, 0, 0]))   # rgb strip: red is the 1st byte
+
+    def test_pacing_follows_the_link(self):
+        import asyncio
+
+        class SlowLink(FakeClient):  # every acknowledged write waits for a 0.2 s queue drain
+            async def write_gatt_char(self, char, data, response):
+                await super().write_gatt_char(char, data, response)
+                if response:
+                    await asyncio.sleep(0.2)
+
+        g = L.Group([])
+        d = L.Device("s", "AA:BB:CC:DD:EE:09", "rgb")
+        g.devices.append(d)
+        g.clients[d] = SlowLink()
+        self.assertAlmostEqual(g.pace(60), 1 / 60)  # nothing measured yet: the requested rate
+
+        async def go():
+            for _ in range(24):
+                await g.stream(b"x", barrier=4)
+            await g.drain()
+        self.run_async(go())
+        self.assertAlmostEqual(g.link_dt, 0.05, delta=0.01)  # answers 0.2 s apart, 4 frames each
+        self.assertAlmostEqual(g.pace(60), 0.045, delta=0.01)  # 10 % above what the link delivers
+        self.assertAlmostEqual(g.pace(5), 0.2)                 # slower requests are kept
 
     def test_plain_bytes_go_to_everyone(self):
         g = self.group("gbr", "gbr")

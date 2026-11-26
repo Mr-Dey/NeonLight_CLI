@@ -15,7 +15,7 @@ GATT service fff0, write characteristic fff3. Every command is 9 bytes:
     effect          7e 05 03 MM 06 ff ff 00 ef      MM from MODES below
     effect speed    7e 04 02 SS ff ff ff 00 ef      SS 0-100
     controller mic  7e 04 07 on ff ff ff 00 ef / style 7e 07 03 (80+n) 04 ff ff 00 ef / sens 7e 04 06 SS ff ff ff 00 ef
-    wiring order    7e 06 81 a b c ff 00 ef         stored on the controller
+    wiring order    7e 06 81 a b c ff 00 ef         stored; output j gets colour abc[j] (colours and effects)
     LED count       7e 07 21 lo hi 00 ff 00 ef      stored on the controller
     clock           7e 07 83 HH MM SS WD ff ef      WD 0=Sunday
     timer           7e 08 82 HH MM SS T  DD ef      T 0=on-timer 1=off-timer, DD bit0=Mon..bit6=Sun, bit7=enabled
@@ -39,6 +39,7 @@ import random
 import re
 import subprocess
 import sys
+import time
 
 from bleak import BleakClient, BleakScanner
 
@@ -336,9 +337,16 @@ def cmd_mic_sens(pct: int) -> bytes:
     return bytes([0x7E, 0x04, 0x06, pct, 0xFF, 0xFF, 0xFF, 0x00, 0xEF])
 
 
-def cmd_wiring(order: str) -> bytes:
-    """Stored wiring order, as the app's pin-sequence dialog sends it ("G B R" -> 02 03 01)."""
-    a, b, c = ("rgb".index(ch) + 1 for ch in order)
+def cmd_wiring(physical: str) -> bytes:
+    """Store a strip's wiring on its controller (the app's pin-sequence setting, "G R B" -> 02 01 03).
+
+    `physical` is the strip's real LED order, i.e. the --order you find after resetting the
+    controller with --set-wiring rgb (01 02 03 = no re-mapping). The controller then feeds output j
+    with colour seq[j], for plain colours and its own effects alike, so both come out right and
+    the strip is used with --order rgb. (Verified on a MELK-OA10 that had "R B G" stored from before:
+    it looked like 'gbr' but is really wired 'grb'.)
+    """
+    a, b, c = ("rgb".index(ch) + 1 for ch in physical)
     return bytes([0x7E, 0x06, 0x81, a, b, c, 0xFF, 0x00, 0xEF])
 
 
@@ -650,7 +658,10 @@ class Group:
         self.devices, self.verbose = devices, verbose
         self.clients: dict[Device, BleakClient] = {}
         self.muted: set[str] = set()  # strip names temporarily left out (the UI's per-strip switches)
-        self.n = 0
+        self.n = 0                    # stream frames sent (each goes to every strip)
+        self.link_dt = 0.0            # measured seconds per stream frame when the link is the bottleneck
+        self._barrier_t: float | None = None
+        self._barrier_task: asyncio.Task | None = None
 
     @property
     def live(self) -> list[Device]:
@@ -724,6 +735,8 @@ class Group:
         self._warn(d, f"could not connect: {last}")
 
     async def __aexit__(self, *exc) -> None:
+        if self._barrier_task is not None:
+            self._barrier_task.cancel()
         await asyncio.gather(*(c.disconnect() for c in self.clients.values()), return_exceptions=True)
 
     async def write(self, pkt, ack: bool = True) -> None:
@@ -739,16 +752,49 @@ class Group:
         if not self.clients:
             raise SystemExit("lightctl: lost the connection to every strip")
 
-    async def stream(self, pkt, barrier: int = 4) -> None:
+    async def stream(self, pkt, barrier: int = 5) -> None:
         """Fast writes for animations, music and screen sync without lag building up.
 
-        Each link carries only ~13 writes/s (the strips ask for a ~75 ms connection interval).
+        Each link carries only ~10-16 writes/s (the strips ask for a ~75 ms connection interval).
         Unacknowledged writes are accepted instantly and queue up, so streaming faster than that makes
-        a strip fall further and further behind. Every `barrier`-th write is acknowledged: it returns
-        only once everything queued before it has been delivered, so at most a few frames wait.
+        a strip fall further and further behind. So after every `barrier` frames an acknowledged
+        no-op (a timer query, as the app sends: nothing visible changes) is written in the
+        background. It returns once everything queued before it was delivered: the time between
+        those answers is what the link really delivers (see pace()), and a new one only starts
+        after the previous one answered, so at most ~2 x `barrier` frames are ever waiting.
+        barrier=1 makes every frame an acknowledged write instead (slow, but nothing queues).
         """
         self.n += 1
-        await self.write(pkt, ack=self.n % barrier == 0)
+        if barrier <= 1:
+            await self.write(pkt, ack=True)
+            return
+        await self.write(pkt, ack=False)
+        if self.n % barrier == 0:
+            if self._barrier_task is not None and not self._barrier_task.done():
+                await self._barrier_task  # backpressure: the link is behind
+            self._barrier_task = asyncio.create_task(self._barrier(barrier))
+
+    async def _barrier(self, frames: int) -> None:
+        try:
+            await self.write(cmd_timer_query(TIMER_ON), ack=True)
+        except SystemExit:  # every strip gone: the next stream write reports it
+            return
+        now = time.monotonic()
+        if self._barrier_t is not None and now - self._barrier_t < 1.5:  # ignore idle gaps
+            dt_ = (now - self._barrier_t) / frames
+            self.link_dt = dt_ if self.link_dt == 0 else 0.8 * self.link_dt + 0.2 * dt_
+        self._barrier_t = now
+
+    async def drain(self) -> None:
+        """Wait for the last background acknowledgement (end of a stream)."""
+        if self._barrier_task is not None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._barrier_task
+
+    def pace(self, fps: float) -> float:
+        """Seconds until the next stream frame: the requested rate, but not faster than the link has
+        been delivering (probing 10 % above it, so a faster link is picked up again)."""
+        return max(1 / fps, 0.9 * self.link_dt)
 
 
 async def scan(seconds: float) -> None:
@@ -1279,13 +1325,13 @@ def _srgb(x: float) -> float:
 
 
 def screen_color(frame: bytes, region: str = "full", saturation: float = 1.3,
-                 floor: int = 5) -> tuple[float, float, float] | None:
+                 floor: int = 5, gain: float = 1.25) -> tuple[float, float, float] | None:
     """One colour for the whole screen, 0-255 floats; None if the frame is entirely black.
 
     Colours are mixed in linear light. Each pixel counts by brightness x colourfulness, so vivid
     areas lead and black bars or dark UI don't wash the result out. How bright the strip glows follows
     the screen's average brightness (each pixel's strongest channel, so a vivid red screen counts as
-    bright), never below `floor` %; `saturation` makes the colour a bit punchier.
+    bright), times `gain`, never below `floor` %; `saturation` makes the colour punchier.
     """
     w, h = SCREEN_W, SCREEN_H
     band = max(1, round(min(w, h) * 0.2))
@@ -1315,17 +1361,18 @@ def screen_color(frame: bytes, region: str = "full", saturation: float = 1.3,
     lr, lg, lb = sr / sw, sg / sw, sb / sw
     peak = max(lr, lg, lb) or 1.0
     hue, sat, _ = colorsys.rgb_to_hsv(_srgb(lr / peak), _srgb(lg / peak), _srgb(lb / peak))
-    level = min(1.0, vsum / n * 1.25)  # average brightness of the screen, a little lifted
+    level = min(1.0, vsum / n * gain)  # average brightness of the screen, lifted by `gain`
     value = (floor + (100 - floor) * level) / 100
     r, g, b = colorsys.hsv_to_rgb(hue, min(1.0, sat * saturation), value)
     return r * 255, g * 255, b * 255
 
 
 async def screen_sync(devices: list[Device], fps: float, smooth: float, region: str, saturation: float,
-                      floor: int, duration: float, verbose: bool) -> None:
+                      floor: int, duration: float, verbose: bool, gain: float = 1.25) -> None:
     """Capture -> one colour per frame -> smooth fade at `fps` -> unacknowledged colour frames."""
     target: list[float] | None = None
-    async with ScreenCapture(fps, verbose) as cap, _connected(devices, verbose) as g:
+    # capturing faster than ~30/s costs CPU without making the light any smoother
+    async with ScreenCapture(min(fps, 30), verbose) as cap, _connected(devices, verbose) as g:
         await g.write(cmd_power(True))
         await g.write(cmd_brightness(100, 0x01))
         log(f"screen sync on {g.names()} at {fps:g} updates/s, fade {smooth:g}s")
@@ -1333,7 +1380,7 @@ async def screen_sync(devices: list[Device], fps: float, smooth: float, region: 
         async def reader() -> None:
             nonlocal target
             while True:
-                c = screen_color(await cap.frame(), region, saturation, floor)
+                c = screen_color(await cap.frame(), region, saturation, floor, gain)
                 if c is not None:
                     target = list(c)
                 elif target is not None:  # black screen: keep the hue, drop to the floor
@@ -1361,7 +1408,7 @@ async def screen_sync(devices: list[Device], fps: float, smooth: float, region: 
                         frames += 1
                         if verbose:
                             log(f"{'%02x%02x%02x' % out}")
-                await asyncio.sleep(max(0.0, 1 / fps - (loop.time() - tick)))  # time spent sending counts
+                await asyncio.sleep(max(0.0, g.pace(fps) - (loop.time() - tick)))  # sending time counts
         except asyncio.CancelledError:
             pass
         finally:
@@ -1439,11 +1486,10 @@ async def animate(devices: list[Device], name: str, duration: float, period: flo
                 rgb = fn(now, period, base)
                 if rgb != last:
                     await g.stream(lambda d, rgb=rgb: cmd_color(*rgb, order=d.order),
-                                   barrier=4 if fast else 1)
+                                   barrier=5 if fast else 1)
                     last = rgb
                     frames += 1
-                nxt = t0 + (int(now * fps) + 1) / fps
-                await asyncio.sleep(max(0.0, nxt - loop.time()))
+                await asyncio.sleep(max(0.0, g.pace(fps) - (loop.time() - t0 - now)))
         except asyncio.CancelledError:
             pass
         finally:
@@ -1519,7 +1565,9 @@ def main() -> None:
     sc.add_argument("--smooth", type=float, default=0.12, metavar="SECONDS",
                     help="fade time constant between colours (default 0.12; 0 = instant)")
     sc.add_argument("--saturation", type=float, default=1.3,
-                    help="colour boost, 1.0 = as on screen (default 1.3)")
+                    help="colour boost, 1.0 = as on screen, up to ~4 for very vivid (default 1.3)")
+    sc.add_argument("--gain", type=float, default=1.25,
+                    help="brightness boost, 1.0 = as bright as the screen (default 1.25)")
     sc.add_argument("--region", choices=["full", "edges"], default="full",
                     help="sample the whole screen (default) or only its outer edges")
     sc.add_argument("--screen-reset", action="store_true",
@@ -1532,14 +1580,16 @@ def main() -> None:
                     help="seconds to run --animate / --music / --screen / --tour (default: until Ctrl-C)")
     a_.add_argument("--period", type=float, help="seconds per animation cycle")
     a_.add_argument("--fps", type=float,
-                    help="updates per second (default: 20 for --animate, 12 for --screen, 10 for --music like "
-                         "the app). The Bluetooth link carries about 13/s; faster just drops frames")
+                    help="target updates per second (default: 20 for --animate, 12 for --screen, 10 for --music "
+                         "like the app). Streams never go faster than the Bluetooth link delivers (~13/s here)")
     a_.add_argument("--fast", action="store_true",
                     help="--animate: mostly unacknowledged writes (about 13 updates/s instead of 6)")
 
     s = p.add_argument_group("settings stored on the controller")
     s.add_argument("--set-wiring", type=parse_order, metavar="ORDER",
-                   help="tell the controller the strip's channel order (the app's pin-sequence setting)")
+                   help="store a strip's real LED order on its controller so colours and built-in effects come "
+                        "out right (then it uses --order rgb, saved for you). Find the order after "
+                        "'--set-wiring rgb' (= no re-mapping). One strip at a time (-D NAME)")
     s.add_argument("--leds", type=parse_leds, metavar="N",
                    help="number of addressable points on the strip (10-1000)")
     s.add_argument("--sync-clock", action="store_true", help="set the controller clock to the laptop's")
@@ -1617,6 +1667,11 @@ def main() -> None:
         run(scan(8))
         return
     devices = resolve_targets(a.targets, a.order)
+    if a.set_wiring:
+        if len(devices) != 1:
+            p.error("--set-wiring: pick one strip with -D NAME (each strip has its own wiring)")
+        # once the controller knows the wiring it re-maps by itself: plain R,G,B from now on
+        devices = [dataclasses.replace(devices[0], order="rgb")]
     if a.animate:
         run(animate(devices, a.animate, a.duration, a.period, a.color,
                     a.fps or 20, a.verbose, a.fast))
@@ -1630,10 +1685,10 @@ def main() -> None:
         if not a.screen:
             return
     if a.screen:
-        if a.smooth < 0 or a.saturation < 0:
-            p.error("--smooth and --saturation must not be negative")
+        if a.smooth < 0 or a.saturation < 0 or a.gain <= 0:
+            p.error("--smooth and --saturation must not be negative, --gain must be positive")
         run(screen_sync(devices, a.fps or 12, a.smooth, a.region, a.saturation, a.floor,
-                        a.duration, a.verbose))
+                        a.duration, a.verbose, a.gain))
         return
     if a.music and a.effect:
         for spec in a.effect:  # validate names before connecting
@@ -1706,6 +1761,13 @@ def main() -> None:
         p.print_help()
         return
     run(send(devices, packets, a.verbose))
+    if a.set_wiring:
+        d, saved = devices[0], load_devices()
+        if d.name in saved:
+            saved[d.name] = dataclasses.replace(saved[d.name], order=d.order)
+            save_devices(saved)
+        log(f"{d.name}: wiring {a.set_wiring} stored on the controller; colours are now sent as plain rgb"
+            + ("" if d.name in saved else " (use --order rgb for this strip)"), err=False)
 
 
 if __name__ == "__main__":
