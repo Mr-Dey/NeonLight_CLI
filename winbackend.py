@@ -26,6 +26,25 @@ def _need(module: str, pip_name: str):
                          "  .venv\\Scripts\\pip install -r requirements.txt") from None
 
 
+def _mss(mss_mod):
+    return (getattr(mss_mod, "MSS", None) or mss_mod.mss)()
+
+
+def timer_resolution(enable: bool, ms: int = 1) -> bool:
+    """Request/release a finer Windows sleep timer tick (default ~15.6 ms -> 1 ms) while streaming."""
+    if not IS_WINDOWS:
+        return False
+    with contextlib.suppress(Exception):
+        fn = ctypes.windll.winmm.timeBeginPeriod if enable else ctypes.windll.winmm.timeEndPeriod
+        return fn(ms) == 0
+    return False
+    try:
+        return __import__(module)
+    except ImportError:
+        raise SystemExit(f"lightctl: this needs the '{pip_name}' package. In the project folder run:\n"
+                         "  .venv\\Scripts\\pip install -r requirements.txt") from None
+
+
 # ---------- COM: soundcard talks to WASAPI through COM, which must be initialised per thread ----------
 
 def _com_init() -> bool:
@@ -61,13 +80,39 @@ def _in_com_thread(fn, *args):
     return out.get("value")
 
 
+def _import_soundcard():
+    """Import `soundcard` on a fresh thread without COM initialised yet.
+
+    soundcard.mediafoundation creates a module-level _COMLibrary() that calls
+    CoInitializeEx(..., COINIT_MULTITHREADED) and raises on S_FALSE (1). Calling _com_init()
+    first on the same thread (or importing after WinRT/bleak already set COM on the main
+    thread) therefore crashes with RuntimeError('Error 0x100000001').
+    """
+    if "soundcard" in sys.modules:
+        return sys.modules["soundcard"]
+    out: dict = {}
+
+    def load() -> None:
+        try:
+            out["mod"] = _need("soundcard", "soundcard")
+        except BaseException as e:  # noqa: BLE001 - handed back to the caller
+            out["error"] = e
+
+    t = threading.Thread(target=load, daemon=True)
+    t.start()
+    t.join()
+    if "error" in out:
+        raise out["error"]
+    return out["mod"]
+
+
 # ---------- audio ----------
 
 def audio_sources() -> list[dict]:
     """Every audio input, same shape as on Linux: name (WASAPI id), desc, monitor.
     'monitor' inputs record what a speaker plays (WASAPI loopback)."""
     def run():
-        sc = _need("soundcard", "soundcard")
+        sc = _import_soundcard()
         return [{"name": m.id, "desc": m.name, "monitor": bool(getattr(m, "isloopback", False))}
                 for m in sc.all_microphones(include_loopback=True)]
     return _in_com_thread(run)
@@ -76,7 +121,7 @@ def audio_sources() -> list[dict]:
 def default_audio() -> tuple[str | None, str | None]:
     """(id of the default speaker, whose loopback carries what is playing; id of the default mic)."""
     def run():
-        sc = _need("soundcard", "soundcard")
+        sc = _import_soundcard()
         spk = mic = None
         with contextlib.suppress(Exception):
             spk = sc.default_speaker().id
@@ -124,7 +169,7 @@ class WinAudioInput:
 
         ok = _com_init()
         try:
-            sc = _need("soundcard", "soundcard")
+            sc = _import_soundcard()
             np = _need("numpy", "numpy")
             mic = sc.get_microphone(self.device_id, include_loopback=self.loopback)
             with mic.recorder(samplerate=self.RATE, channels=1, blocksize=self.chunk) as rec:
@@ -212,7 +257,7 @@ def list_windows() -> list[dict]:
     u = _user32()
     out: list[dict] = []
 
-    @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
     def each(hwnd, _lparam):
         if not hwnd or not u.IsWindowVisible(hwnd) or u.IsIconic(hwnd) or not u.GetWindowTextLengthW(hwnd):
             return True
@@ -231,7 +276,7 @@ def list_windows() -> list[dict]:
 def list_monitors() -> list[dict]:
     """Monitors as mss numbers them (1, 2, ...), with which one is the primary."""
     mss = _need("mss", "mss")
-    with mss.mss() as sct:
+    with _mss(mss) as sct:
         mons = list(sct.monitors[1:])
     primary = next((i for i, m in enumerate(mons) if m.get("is_primary")), None)
     if primary is None:  # older mss: the primary monitor sits at (0, 0)
@@ -312,7 +357,7 @@ class WinScreenCapture:
         try:
             mss = _need("mss", "mss")
             from PIL import Image
-            with mss.mss() as sct:  # also makes the process per-monitor DPI aware
+            with _mss(mss) as sct:  # also makes the process per-monitor DPI aware
                 mons = sct.monitors
                 if self.monitor_index and 1 <= self.monitor_index < len(mons):
                     mon = mons[self.monitor_index]

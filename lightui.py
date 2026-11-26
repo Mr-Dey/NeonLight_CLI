@@ -383,7 +383,7 @@ class LightUI(App):
 
     def source_options(self) -> list[tuple[str, str]]:
         opts = [("Computer audio - whatever is playing", "system"), ("Default microphone", "mic")]
-        with contextlib.suppress(SystemExit, OSError, ValueError):
+        with contextlib.suppress(SystemExit, OSError, ValueError, RuntimeError):
             for src in L.audio_sources():
                 if not src["monitor"]:
                     opts.append((f"Microphone: {src['desc']}", src["name"]))
@@ -507,10 +507,11 @@ class LightUI(App):
                 return
 
     def set_switch(self, selector: str, value: bool) -> None:
-        sw = self.query_one(selector, Switch)
-        if sw.value != value:
-            with self.prevent(Switch.Changed):
-                sw.value = value
+        with contextlib.suppress(Exception):
+            sw = self.query_one(selector, Switch)
+            if sw.value != value:
+                with self.prevent(Switch.Changed):
+                    sw.value = value
 
     # ---------- modes: only one runs at a time ----------
 

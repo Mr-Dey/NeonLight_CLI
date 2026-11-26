@@ -798,10 +798,15 @@ class LiveFeed:
         self.frames: collections.deque = collections.deque()  # (time, pkt), oldest first
         self.rtt: dict[Device, float] = {}
         self.tasks: dict[Device, asyncio.Task] = {}
+        self.wake: dict[Device, asyncio.Event] = {}
         self.closed = False
+        self._hi_timer = False
         g.delivered = {}
 
     async def __aenter__(self) -> "LiveFeed":
+        if IS_WINDOWS and not self._hi_timer:
+            import winbackend
+            self._hi_timer = winbackend.timer_resolution(True)
         return self
 
     async def __aexit__(self, *exc) -> None:
@@ -809,11 +814,15 @@ class LiveFeed:
 
     def push(self, pkt) -> None:
         """A new frame: the same bytes for every strip, or a function Device -> bytes (colours)."""
+        if IS_WINDOWS and not self._hi_timer and not self.closed:
+            import winbackend
+            self._hi_timer = winbackend.timer_resolution(True)
         now = time.monotonic()
         self.frames.append((now, pkt))
         while len(self.frames) > 2 and now - self.frames[1][0] > self.MAX_SKEW + 0.5:
             self.frames.popleft()
         for d, c in list(self.g.clients.items()):
+            self.wake.setdefault(d, asyncio.Event()).set()
             task = self.tasks.get(d)
             if task is None or task.done():
                 self.tasks[d] = asyncio.create_task(self._sender(d, c))
@@ -842,18 +851,31 @@ class LiveFeed:
     async def _sender(self, d: Device, c: BleakClient) -> None:
         sent_t: float | None = None
         last_send, n = 0.0, 0
+        wake = self.wake.setdefault(d, asyncio.Event())
         while not self.closed and self.g.clients.get(d) is c:
             if d.name in self.g.muted or not self.frames:
-                await asyncio.sleep(0.01)
+                wake.clear()
+                if not self.frames:
+                    with contextlib.suppress(asyncio.TimeoutError):
+                        await asyncio.wait_for(wake.wait(), timeout=0.05)
+                else:
+                    await asyncio.sleep(0.02)
                 continue
             gap = self.rtt.get(d, 0.0) / 2 / self.UTILISATION  # one connection event, with headroom
             wait = last_send + gap - time.monotonic()
             if wait > 0:
                 await asyncio.sleep(min(wait, 0.05))
                 continue
+            wake.clear()
             t, pkt = self._pick(d)
-            if sent_t is not None and t <= sent_t:  # nothing newer for this strip yet
-                await asyncio.sleep(0.005)
+            if sent_t is not None and t <= sent_t:  # nothing newer ready for this strip yet
+                cutoff = time.monotonic() - self.holdback(d)
+                next_t = next((ft for ft, _ in self.frames if ft > sent_t), None)
+                if next_t is not None and next_t > cutoff:
+                    with contextlib.suppress(asyncio.TimeoutError):
+                        await asyncio.wait_for(wake.wait(), timeout=max(0.001, next_t - cutoff))
+                else:
+                    await wake.wait()
                 continue
             n += 1
             ack = d not in self.rtt or n % self.ack_every == 0  # the first write measures the link
@@ -873,9 +895,15 @@ class LiveFeed:
 
     async def close(self) -> None:
         self.closed = True
+        for ev in self.wake.values():
+            ev.set()
         for task in self.tasks.values():
             task.cancel()
         await asyncio.gather(*self.tasks.values(), return_exceptions=True)
+        if self._hi_timer:
+            import winbackend
+            winbackend.timer_resolution(False)
+            self._hi_timer = False
 
 
 async def scan(seconds: float) -> None:
@@ -1854,7 +1882,8 @@ def main() -> None:
         try:
             from lightui import run_ui
         except ImportError as e:
-            raise SystemExit(f"lightctl: the UI needs Textual ({e}); run: .venv/bin/pip install -r requirements.txt")
+            pip_cmd = r".venv\Scripts\pip" if IS_WINDOWS else ".venv/bin/pip"
+            raise SystemExit(f"lightctl: the UI needs Textual ({e}); run: {pip_cmd} install -r requirements.txt")
         run_ui(a.targets, a.order)
         return
 

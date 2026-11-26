@@ -158,6 +158,43 @@ class WindowsBackends(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(Exception):
                 L.parse_capture(bad)
 
+    def test_soundcard_imported_without_prior_com_init(self):
+        # soundcard.mediafoundation initializes COM at import time and fails if COM is already
+        # initialized on the importing thread; verify _import_soundcard() isolates the import.
+        import threading
+        saved_sc = sys.modules.pop("soundcard", None)
+        saved_import = __builtins__["__import__"] if isinstance(__builtins__, dict) else __builtins__.__import__
+        import builtins
+        import_threads = []
+        fake = fake_soundcard()
+
+        def spy_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "soundcard":
+                import_threads.append(threading.get_ident())
+                sys.modules["soundcard"] = fake
+                return fake
+            return saved_import(name, globals, locals, fromlist, level)
+
+        caller_threads = []
+        orig_com_init = W._com_init
+
+        def spy_com_init():
+            caller_threads.append(threading.get_ident())
+            return orig_com_init()
+
+        builtins.__import__ = spy_import
+        W._com_init = spy_com_init
+        try:
+            srcs = L.audio_sources()
+        finally:
+            builtins.__import__ = saved_import
+            W._com_init = orig_com_init
+            if saved_sc is not None:
+                sys.modules["soundcard"] = saved_sc
+        self.assertEqual(len(srcs), 2)
+        self.assertEqual(len(import_threads), 1)
+        self.assertNotEqual(import_threads[0], caller_threads[0])
+
 
 @unittest.skipUnless(HAVE_DEPS, "needs numpy and Pillow")
 class WindowsUI(unittest.IsolatedAsyncioTestCase):
