@@ -150,26 +150,82 @@ class Screen(unittest.TestCase):
         self.assertLess(max(r, g, b), 40)
 
 
-class StreamWriter(unittest.TestCase):
-    def test_every_fourth_write_is_acknowledged(self):
+class FakeClient:
+    def __init__(self):
+        self.writes = []
+
+    async def write_gatt_char(self, char, data, response):
+        self.writes.append((bytes(data), response))
+
+
+class GroupWrites(unittest.TestCase):
+    def group(self, *orders):
+        import asyncio  # noqa: F401
+        g = L.Group([])
+        for i, order in enumerate(orders):
+            d = L.Device(f"s{i}", f"AA:BB:CC:DD:EE:0{i}", order)
+            g.devices.append(d)
+            g.clients[d] = FakeClient()
+        return g
+
+    def run_async(self, coro):
         import asyncio
+        asyncio.run(coro)
 
-        class Fake:
-            def __init__(self):
-                self.acks = []
-
-            async def write_gatt_char(self, char, data, response):
-                self.acks.append(response)
-
-        fake = Fake()
-        s = L.Stream(fake, barrier=4)
+    def test_every_fourth_stream_write_is_acknowledged(self):
+        g = self.group("gbr")
 
         async def go():
             for _ in range(8):
-                await s.send(b"x")
-        asyncio.run(go())
-        self.assertEqual(fake.acks, [False, False, False, True] * 2)
+                await g.stream(b"x")
+        self.run_async(go())
+        acks = [r for _, r in next(iter(g.clients.values())).writes]
+        self.assertEqual(acks, [False, False, False, True] * 2)
 
+    def test_same_moment_each_strips_own_wiring(self):
+        g = self.group("gbr", "rgb")
+        self.run_async(g.write(lambda d: L.cmd_color(255, 0, 0, order=d.order)))
+        a, b = (c.writes[0][0] for c in g.clients.values())
+        self.assertEqual(a[4:7], bytes([0, 0, 255]))   # gbr strip: red is the 3rd byte
+        self.assertEqual(b[4:7], bytes([255, 0, 0]))   # rgb strip: red is the 1st byte
+
+    def test_plain_bytes_go_to_everyone(self):
+        g = self.group("gbr", "gbr")
+        self.run_async(g.write(L.cmd_power(True)))
+        self.assertTrue(all(c.writes == [(L.cmd_power(True), True)] for c in g.clients.values()))
+
+
+class Devices(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old = L.DEVICES_FILE
+        L.DEVICES_FILE = f"{self.tmp.name}/devices.json"
+        L.save_devices({"monitor": L.Device("monitor", "BE:69:32:13:B6:00", "gbr"),
+                        "room": L.Device("room", "BE:69:04:14:32:04", "rgb")})
+
+    def tearDown(self):
+        L.DEVICES_FILE = self.old
+        self.tmp.cleanup()
+
+    def test_default_is_every_saved_strip(self):
+        import os
+        env = os.environ.pop("LIGHTCTL_ADDR", None)
+        try:
+            self.assertEqual([d.name for d in L.resolve_targets(None)], ["monitor", "room"])
+        finally:
+            if env is not None:
+                os.environ["LIGHTCTL_ADDR"] = env
+
+    def test_names_macs_and_override(self):
+        self.assertEqual([d.name for d in L.resolve_targets("room")], ["room"])
+        self.assertEqual(L.resolve_targets("be:69:32:13:b6:00")[0].name, "monitor")  # MAC of a saved strip
+        self.assertEqual([d.order for d in L.resolve_targets("all", "brg")], ["brg", "brg"])
+        self.assertEqual(len(L.resolve_targets("monitor,all")), 2)  # no duplicates
+
+    def test_unknown_name(self):
+        with self.assertRaises(SystemExit):
+            L.resolve_targets("kitchen")
 
 if __name__ == "__main__":
     unittest.main()

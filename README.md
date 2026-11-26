@@ -9,6 +9,8 @@ and [bleak](https://github.com/hbldh/bleak).
 
 ## Features
 
+- **Several strips at once**: every command, animation, music or screen frame goes to all
+  saved strips at the same moment, each with its own wiring
 - Power, RGB colour (name, hex or `R,G,B`), brightness
 - All 213 built-in effects from the app's Mode tab, by name, `tab:number` or id, with speed,
   plus `--tour` to browse them
@@ -38,18 +40,28 @@ If you clone somewhere else, edit that first line to your venv's Python.
 Music mode needs PulseAudio or PipeWire (`parec`, `pactl`). Screen sync needs
 `xdg-desktop-portal` and GStreamer with its PipeWire plugin (`gst-launch-1.0`, `pipewiresrc`).
 
-Find your strip and set its address (or edit `DEFAULT_ADDR` in the script):
+Find your strips and save them under names:
 
 ```bash
 lightctl --scan
-export LIGHTCTL_ADDR=AA:BB:CC:DD:EE:FF
+lightctl --add-device monitor BE:69:32:13:B6:00
+lightctl --add-device room BE:69:04:14:32:04 --order rgb   # this one is wired R-G-B
+lightctl --devices
 ```
+
+Saved strips live in `~/.config/lightctl/devices.json`. Without any saved strips the
+CLI uses `$LIGHTCTL_ADDR`, or `DEFAULT_ADDR` from the script.
 
 > Close the phone app first. The controller accepts only one BLE connection.
 
 ## Usage
 
 ```bash
+# which strips: every saved strip by default, or pick with -D / --device
+lightctl --color blue                         # all strips
+lightctl -D room --color blue                 # just one
+lightctl -D monitor --screen                  # screen sync on the monitor strip only
+
 # light
 lightctl --power on --color red --brightness 60
 lightctl --color 255,120,0                    # or ff7800, #f70, warm, purple…
@@ -101,6 +113,25 @@ lightctl --leds 150                           # number of addressable points (10
 lightctl --animate rainbow                    # streams until Ctrl-C
 lightctl --animate fire --fast --duration 30
 ```
+
+## Several strips
+
+All strips are found with one Bluetooth scan and connected in parallel. Each command or
+stream frame is then written to all of them at once (`asyncio.gather`). Colours the laptop
+sends are re-ordered for each strip's wiring. A strip that is off or drops out is skipped
+with a warning while the others carry on. Each strip has its own Bluetooth link, so
+streams don't get slower with more strips.
+
+Built-in effects are drawn by each controller itself, so for them to match:
+
+- **Wiring:** the laptop's re-ordering can't fix the colours of built-in effects. Store a
+  strip's wiring on its controller with `--set-wiring` (the app's pin-sequence setting),
+  then save it with `--order rgb`. Built-in effects then show the right colours.
+- **Speed:** each controller stores its own speed. With several strips the CLI sends
+  speed 80 (or `--speed`) whenever it starts an effect.
+- **Length:** strips with a different `--leds` count draw moving effects differently.
+- Each controller starts an effect when its command arrives, so strips can be up to one
+  connection interval (about 75 ms) apart.
 
 ## Music mode
 

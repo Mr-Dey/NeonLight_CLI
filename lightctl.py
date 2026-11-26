@@ -29,6 +29,7 @@ import array
 import asyncio
 import collections
 import colorsys
+import dataclasses
 import datetime as dt
 import json
 import math
@@ -43,6 +44,9 @@ from bleak import BleakClient, BleakScanner
 DEFAULT_ADDR = "BE:69:32:13:B6:00"
 # Channel wiring of this strip, verified by hand: byte1 lights green, byte2 blue, byte3 red.
 DEFAULT_ORDER = "gbr"
+# Effects run on each controller with its own stored speed; with several strips we send this one
+# (unless --speed is given) so they move alike. 80 is what the loved music-effects run used.
+SYNC_SPEED = 80
 WRITE_CHAR = "0000fff3-0000-1000-8000-00805f9b34fb"
 NAME_PREFIXES = ("ELK", "MELK", "LEDBLE", "BLEDOM")
 
@@ -523,8 +527,8 @@ def list_modes(filter_: str | None) -> None:
             print(f"  {i:>3}  {name:<34} 0x{mid:02x}")
 
 
-async def tour(addr: str, filter_: str | None, interval: float, speed: int | None,
-               duration: float) -> None:
+async def tour(devices: list[Device], filter_: str | None, interval: float, speed: int | None,
+               duration: float, verbose: bool = False) -> None:
     """Play effects one after another, printing each, so you can find the ones you like."""
     items = []
     for group, lst in group_lists().items():
@@ -533,12 +537,12 @@ async def tour(addr: str, filter_: str | None, interval: float, speed: int | Non
                 items.append((f"{group}:{i}", name, mid))
     if not items:
         raise SystemExit(f"lightctl: no effects match {filter_!r} (see --list-modes)")
-    async with BleakClient(addr, timeout=15) as client:
-        await asyncio.sleep(0.3)
-        w = lambda pkt: client.write_gatt_char(WRITE_CHAR, pkt, response=True)  # noqa: E731
-        await w(cmd_power(True))
+    async with Group(devices, verbose) as g:
+        await g.write(cmd_power(True))
+        if speed is None and len(g.live) > 1:
+            speed = SYNC_SPEED
         if speed is not None:
-            await w(cmd_speed(speed))
+            await g.write(cmd_speed(speed))
         loop = asyncio.get_running_loop()
         t0 = loop.time()
         print(f"touring {len(items)} effects, {interval:g}s each - Ctrl-C keeps the current one",
@@ -548,13 +552,170 @@ async def tour(addr: str, filter_: str | None, interval: float, speed: int | Non
                 if duration and loop.time() - t0 >= duration:
                     break
                 print(f"[{n:>3}/{len(items)}] {ref:<12} {name:<34} 0x{mid:02x}", flush=True)
-                await w(cmd_mode(mid))
+                await g.write(cmd_mode(mid))
                 await asyncio.sleep(interval)
         except asyncio.CancelledError:
             pass
 
 
-# ---------- BLE ----------
+# ---------- devices: one or more strips, controlled together ----------
+
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "lightctl")
+DEVICES_FILE = os.path.join(CONFIG_DIR, "devices.json")
+MAC_RE = re.compile(r"[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}")
+
+
+@dataclasses.dataclass(frozen=True)
+class Device:
+    name: str
+    addr: str
+    order: str = DEFAULT_ORDER
+
+
+def load_devices() -> dict[str, Device]:
+    try:
+        with open(DEVICES_FILE) as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        raise SystemExit(f"lightctl: cannot read {DEVICES_FILE}: {e}") from None
+    return {name: Device(name, v["addr"].upper(), v.get("order", DEFAULT_ORDER))
+            for name, v in raw.get("devices", {}).items()}
+
+
+def save_devices(devs: dict[str, Device]) -> None:
+    os.makedirs(os.path.dirname(DEVICES_FILE), exist_ok=True)
+    data = {"devices": {d.name: {"addr": d.addr, "order": d.order} for d in devs.values()}}
+    tmp = DEVICES_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, DEVICES_FILE)
+
+
+def resolve_targets(spec: str | None, order: str | None = None) -> list[Device]:
+    """'monitor,room' / 'all' / MACs -> devices. Default: $LIGHTCTL_ADDR, else every saved strip,
+    else the built-in DEFAULT_ADDR. An explicit --order overrides each strip's saved wiring."""
+    saved = load_devices()
+    if spec is None:
+        spec = os.environ.get("LIGHTCTL_ADDR") or ("all" if saved else DEFAULT_ADDR)
+    out: list[Device] = []
+    for part in (p.strip() for p in spec.split(",")):
+        if not part:
+            continue
+        if part.lower() == "all":
+            if not saved:
+                raise SystemExit("lightctl: no saved strips yet - see lightctl --add-device")
+            out.extend(saved.values())
+        elif part in saved:
+            out.append(saved[part])
+        elif MAC_RE.fullmatch(part):
+            known = next((d for d in saved.values() if d.addr == part.upper()), None)
+            out.append(known or Device(part.upper(), part.upper(),
+                                       os.environ.get("LIGHTCTL_ORDER", DEFAULT_ORDER)))
+        else:
+            raise SystemExit(f"lightctl: unknown strip {part!r} "
+                             f"(saved: {', '.join(saved) or 'none'}; or give a MAC address)")
+    uniq: list[Device] = []
+    for d in out:
+        if all(d.addr != u.addr for u in uniq):
+            uniq.append(d)
+    if order:
+        uniq = [dataclasses.replace(d, order=order) for d in uniq]
+    return uniq
+
+
+class Group:
+    """Connections to one or more strips. Every write goes to all of them at the same moment
+    (colours re-ordered for each strip's wiring). A strip that can't be reached, or drops out,
+    is skipped with a warning while the others carry on."""
+
+    def __init__(self, devices: list[Device], verbose: bool = False) -> None:
+        self.devices, self.verbose = devices, verbose
+        self.clients: dict[Device, BleakClient] = {}
+        self.n = 0
+
+    @property
+    def live(self) -> list[Device]:
+        return [d for d in self.devices if d in self.clients]
+
+    def names(self) -> str:
+        return ", ".join(d.name for d in self.live)
+
+    @staticmethod
+    def _warn(d: Device, msg: str) -> None:
+        print(f"lightctl: {d.name}: {msg}", file=sys.stderr)
+
+    async def __aenter__(self) -> "Group":
+        want = {d.addr for d in self.devices}
+        found: dict[str, object] = {}
+        all_found = asyncio.Event()
+
+        def seen(dev, adv) -> None:
+            a = dev.address.upper()
+            if a in want and a not in found:
+                found[a] = dev
+                if len(found) == len(want):
+                    all_found.set()
+
+        async with BleakScanner(detection_callback=seen):  # one scan finds every strip
+            try:
+                await asyncio.wait_for(all_found.wait(), timeout=10)
+            except asyncio.TimeoutError:
+                pass
+        for d in self.devices:
+            if d.addr not in found:
+                self._warn(d, "not found (switched off, out of range, or connected to the phone app?)")
+        await asyncio.gather(*(self._connect(d, found[d.addr]) for d in self.devices if d.addr in found))
+        if not self.clients:
+            raise SystemExit("lightctl: could not reach any strip.\n"
+                             "Hint: close the phone app (each strip accepts only one connection).")
+        await asyncio.sleep(0.3)  # let the controllers settle after connecting
+        return self
+
+    async def _connect(self, d: Device, ble_device, retries: int = 3) -> None:
+        last: Exception | None = None
+        for attempt in range(retries):
+            client = BleakClient(ble_device, timeout=15)
+            try:
+                await client.connect()
+                self.clients[d] = client
+                return
+            except Exception as e:  # noqa: BLE001 - bleak raises a mix of types
+                last = e
+                if self.verbose:
+                    self._warn(d, f"connect attempt {attempt + 1} failed: {e}")
+                await asyncio.sleep(0.5 + attempt)
+        self._warn(d, f"could not connect: {last}")
+
+    async def __aexit__(self, *exc) -> None:
+        await asyncio.gather(*(c.disconnect() for c in self.clients.values()), return_exceptions=True)
+
+    async def write(self, pkt, ack: bool = True) -> None:
+        """pkt: the same bytes for every strip, or a function Device -> bytes (colours)."""
+        async def one(d: Device, c: BleakClient) -> None:
+            try:
+                await c.write_gatt_char(WRITE_CHAR, pkt(d) if callable(pkt) else pkt, response=ack)
+            except Exception as e:  # noqa: BLE001
+                self.clients.pop(d, None)
+                self._warn(d, f"dropped: {e}")
+
+        await asyncio.gather(*(one(d, c) for d, c in list(self.clients.items())))
+        if not self.clients:
+            raise SystemExit("lightctl: lost the connection to every strip")
+
+    async def stream(self, pkt, barrier: int = 4) -> None:
+        """Fast writes for animations, music and screen sync without lag building up.
+
+        Each link carries only ~13 writes/s (the strips ask for a ~75 ms connection interval).
+        Unacknowledged writes are accepted instantly and queue up, so streaming faster than that makes
+        a strip fall further and further behind. Every `barrier`-th write is acknowledged: it returns
+        only once everything queued before it has been delivered, so at most a few frames wait.
+        """
+        self.n += 1
+        await self.write(pkt, ack=self.n % barrier == 0)
+
 
 async def scan(seconds: float) -> None:
     print(f"Scanning {seconds:.0f}s for LED controllers...")
@@ -564,47 +725,36 @@ async def scan(seconds: float) -> None:
     if not hits:
         print("No ELK/MELK-style devices found. Is the phone app still connected to it?")
         return
+    saved = {d.addr: d.name for d in load_devices().values()}
     for d, adv in sorted(hits, key=lambda x: -x[1].rssi):
-        print(f"  {d.address}  {d.name!r}  RSSI {adv.rssi}")
+        tag = f"   saved as {saved[d.address.upper()]!r}" if d.address.upper() in saved else ""
+        print(f"  {d.address}  {d.name!r}  RSSI {adv.rssi}{tag}")
+    if any(d.address.upper() not in saved for d, _ in hits):
+        print("\nSave a strip under a name with:  lightctl --add-device NAME MAC")
 
 
-async def send(addr: str, packets: list[tuple[str, bytes]], verbose: bool, retries: int = 3) -> None:
-    last_err: Exception | None = None
-    for attempt in range(1, retries + 1):
-        try:
-            async with BleakClient(addr, timeout=15) as client:
-                await asyncio.sleep(0.3)  # let the controller settle after connect
-                for label, pkt in packets:
-                    if verbose:
-                        print(f"{label:<12} {pkt.hex(' ')}")
-                    # acknowledged write, like the app (WRITE_TYPE_DEFAULT); unacked writes got dropped
-                    await client.write_gatt_char(WRITE_CHAR, pkt, response=True)
-                    await asyncio.sleep(0.1)
-                return
-        except Exception as e:  # noqa: BLE001 - bleak raises a mix of types
-            last_err = e
+def list_devices() -> None:
+    saved = load_devices()
+    if not saved:
+        print("No saved strips. Find them with --scan, then: lightctl --add-device NAME MAC")
+        return
+    print("Saved strips (commands go to all of them unless you pick some with --device):")
+    for d in saved.values():
+        print(f"  {d.name:<12} {d.addr}   wiring {d.order}")
+
+
+async def send(devices: list[Device], packets: list[tuple[str, object]], verbose: bool) -> None:
+    async with Group(devices, verbose) as g:
+        for label, pkt in packets:
             if verbose:
-                print(f"attempt {attempt} failed: {e}", file=sys.stderr)
-            await asyncio.sleep(1)
-    raise SystemExit(f"lightctl: could not reach {addr}: {last_err}\n"
-                     "Hint: close the phone app (the strip accepts only one connection).")
-
-
-class Stream:
-    """Fast writes for animations, music and screen sync without lag building up.
-
-    The link carries only ~13 writes/s (the strip asks for a ~75 ms connection interval).
-    Unacknowledged writes are accepted instantly and queue up, so streaming faster than that makes
-    the strip fall further and further behind. Every `barrier`-th write is acknowledged: it returns
-    only once everything queued before it has been delivered, so at most a few frames are ever waiting.
-    """
-
-    def __init__(self, client: BleakClient, barrier: int = 4) -> None:
-        self.client, self.barrier, self.n = client, barrier, 0
-
-    async def send(self, pkt: bytes) -> None:
-        self.n += 1
-        await self.client.write_gatt_char(WRITE_CHAR, pkt, response=self.n % self.barrier == 0)
+                if callable(pkt):
+                    for d in g.live:
+                        print(f"{label:<12} {pkt(d).hex(' ')}" + (f"   [{d.name}]" if len(g.live) > 1 else ""))
+                else:
+                    print(f"{label:<12} {pkt.hex(' ')}")
+            # acknowledged write, like the app (WRITE_TYPE_DEFAULT); unacked single writes got dropped
+            await g.write(pkt)
+            await asyncio.sleep(0.1)
 
 
 # ---------- clock & timers (stored on the controller; read back the way the app does) ----------
@@ -634,44 +784,60 @@ def _timer_text(v: bytes | None) -> str:
     return f"{h:02d}:{m:02d}  {days_str(flags)}  ({state})"
 
 
-async def timers(addr: str, set_on, set_off, days: int, verbose: bool) -> None:
-    """Show both timers; set or disable them first if asked. Syncs the clock like the app does."""
-    async with BleakClient(addr, timeout=15) as client:
-        await asyncio.sleep(0.3)
-        w = lambda pkt: client.write_gatt_char(WRITE_CHAR, pkt, response=True)  # noqa: E731
-        await w(cmd_clock(dt.datetime.now()))
-        for which, label, new in ((TIMER_ON, "on-timer ", set_on), (TIMER_OFF, "off-timer", set_off)):
-            if new is not None:
-                if new == "off":  # keep the stored time and days, clear the enabled bit
-                    cur = await _query_timer(client, which)
-                    if cur is not None and cur[3] <= 23 and cur[4] <= 59:
-                        pkt = cmd_timer(which, cur[3], cur[4], cur[7], False)
+async def timers(devices: list[Device], set_on, set_off, days: int, verbose: bool) -> None:
+    """Show both timers of every strip; set or disable them first if asked. Syncs the clock like the app."""
+    async with Group(devices, verbose) as g:
+        async def one(client: BleakClient) -> list[str]:
+            out: list[str] = []
+            w = lambda pkt: client.write_gatt_char(WRITE_CHAR, pkt, response=True)  # noqa: E731
+            await w(cmd_clock(dt.datetime.now()))
+            for which, label, new in ((TIMER_ON, "on-timer ", set_on), (TIMER_OFF, "off-timer", set_off)):
+                if new is not None:
+                    if new == "off":  # keep the stored time and days, clear the enabled bit
+                        cur = await _query_timer(client, which)
+                        if cur is not None and cur[3] <= 23 and cur[4] <= 59:
+                            pkt = cmd_timer(which, cur[3], cur[4], cur[7], False)
+                        else:
+                            pkt = cmd_timer(which, 0, 0, days, False)
                     else:
-                        pkt = cmd_timer(which, 0, 0, days, False)
-                else:
-                    pkt = cmd_timer(which, new[0], new[1], days, True)
-                if verbose:
-                    print(f"set {label.strip():<10} {pkt.hex(' ')}")
-                await w(pkt)
-            v = await _query_timer(client, which)
-            if verbose and v is not None:
-                print(f"read {label.strip():<9} {v.hex(' ')}")
-            print(f"{label}: {_timer_text(v)}")
+                        pkt = cmd_timer(which, new[0], new[1], days, True)
+                    if verbose:
+                        out.append(f"set {label.strip():<10} {pkt.hex(' ')}")
+                    await w(pkt)
+                v = await _query_timer(client, which)
+                if verbose and v is not None:
+                    out.append(f"read {label.strip():<9} {v.hex(' ')}")
+                out.append(f"{label}: {_timer_text(v)}")
+            return out
+
+        live = g.live
+        results = await asyncio.gather(*(one(g.clients[d]) for d in live), return_exceptions=True)
+        for d, res in zip(live, results):
+            pad = "  " if len(live) > 1 else ""
+            if len(live) > 1:
+                print(f"[{d.name}]")
+            for line in [f"error: {res}"] if isinstance(res, BaseException) else res:
+                print(pad + line)
 
 
-async def sync_clock(addr: str, verbose: bool) -> None:
-    async with BleakClient(addr, timeout=15) as client:
-        await asyncio.sleep(0.3)
-        pkt = cmd_clock(dt.datetime.now())
-        if verbose:
-            print(f"clock      {pkt.hex(' ')}")
-        await client.write_gatt_char(WRITE_CHAR, pkt, response=True)
-        v = await _read_frame(client, 0x83, 0x07)
-        if v is None:
-            print("clock sent (controller did not echo it back)")
-        else:
+async def sync_clock(devices: list[Device], verbose: bool) -> None:
+    async with Group(devices, verbose) as g:
+        async def one(client: BleakClient) -> str:
+            pkt = cmd_clock(dt.datetime.now())
+            if verbose:
+                print(f"clock      {pkt.hex(' ')}")
+            await client.write_gatt_char(WRITE_CHAR, pkt, response=True)
+            v = await _read_frame(client, 0x83, 0x07)
+            if v is None:
+                return "clock sent (controller did not echo it back)"
             day = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][v[6] % 7]
-            print(f"controller clock: {day} {v[3]:02d}:{v[4]:02d}:{v[5]:02d}")
+            return f"controller clock: {day} {v[3]:02d}:{v[4]:02d}:{v[5]:02d}"
+
+        live = g.live
+        results = await asyncio.gather(*(one(g.clients[d]) for d in live), return_exceptions=True)
+        for d, res in zip(live, results):
+            prefix = f"[{d.name}] " if len(live) > 1 else ""
+            print(prefix + (f"error: {res}" if isinstance(res, BaseException) else res))
 
 
 # ---------- music mode (what the app's Music / phone-mic tabs stream) ----------
@@ -832,7 +998,7 @@ def resolve_effect(spec: str) -> tuple[str, int]:
     return name, mid
 
 
-async def music_effects(addr: str, source: str, fps: float, effects: list[str], switch: str | None,
+async def music_effects(devices: list[Device], source: str, fps: float, effects: list[str], switch: str | None,
                         speed: int | None, floor: int, duration: float, verbose: bool) -> None:
     """Built-in animation keeps running on the controller; the laptop pulses its brightness with the
     music and can rotate effects every N seconds or on strong beats."""
@@ -846,22 +1012,20 @@ async def music_effects(addr: str, source: str, fps: float, effects: list[str], 
     norm = LevelNorm(fps)
     pos = 0
     try:
-        async with BleakClient(addr, timeout=15) as client:
-            await asyncio.sleep(0.3)
-            w = lambda pkt, ack=True: client.write_gatt_char(WRITE_CHAR, pkt, response=ack)  # noqa: E731
-
+        async with Group(devices, verbose) as g:
             async def start(i: int) -> None:
                 name, mid = resolve_effect(effects[i % len(effects)])
                 print(f"effect: {name} (0x{mid:02x})", file=sys.stderr)
-                await w(cmd_mode(mid))
+                await g.write(cmd_mode(mid))
 
-            await w(cmd_power(True))
-            await w(cmd_mic(False))  # make sure the controller isn't in its own mic mode
+            await g.write(cmd_power(True))
+            await g.write(cmd_mic(False))  # make sure the controller isn't in its own mic mode
             await start(pos)
+            if speed is None and len(g.live) > 1:
+                speed = SYNC_SPEED
             if speed is not None:
-                await w(cmd_speed(speed))
-            stream = Stream(client)
-            print(f"music + effect, listening to {dev} - Ctrl-C to stop", file=sys.stderr)
+                await g.write(cmd_speed(speed))
+            print(f"music + effect on {g.names()}, listening to {dev} - Ctrl-C to stop", file=sys.stderr)
             loop = asyncio.get_running_loop()
             t0 = last_switch = loop.time()
             last_v = None
@@ -876,11 +1040,11 @@ async def music_effects(addr: str, source: str, fps: float, effects: list[str], 
                     await start(pos)
                 v = round(floor + (100 - floor) * x)
                 if v != last_v:
-                    await stream.send(cmd_brightness(v))
+                    await g.stream(cmd_brightness(v))
                     last_v = v
                 if verbose:
                     print(f"{d:6.1f} dB  level {x:4.2f}  brightness {v:3d}", file=sys.stderr)
-            await w(cmd_brightness(100))
+            await g.write(cmd_brightness(100))
     except asyncio.IncompleteReadError:
         err = (await proc.stderr.read()).decode(errors="replace").strip()
         raise SystemExit(f"lightctl: audio capture from {dev!r} stopped: {err or 'parec exited'}") from None
@@ -892,8 +1056,8 @@ async def music_effects(addr: str, source: str, fps: float, effects: list[str], 
             await proc.wait()
 
 
-async def music(addr: str, source: str, react: str | None, fps: float, palette: list,
-                threshold: float | None, order: str, duration: float, verbose: bool) -> None:
+async def music(devices: list[Device], source: str, react: str | None, fps: float, palette: list,
+                threshold: float | None, duration: float, verbose: bool) -> None:
     dev, kind = pulse_source(source)  # kind: 'music' for laptop-audio monitors, 'mic' for microphones
     react = react or "music"
     chunk = max(1, round(AUDIO_RATE / fps))
@@ -906,14 +1070,11 @@ async def music(addr: str, source: str, react: str | None, fps: float, palette: 
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     mic = MicReact() if react == "mic" else None
     idx, frames = 0, 0
-    stream = None
     try:
-        async with BleakClient(addr, timeout=15) as client:
-            await asyncio.sleep(0.3)
-            await client.write_gatt_char(WRITE_CHAR, cmd_power(True), response=True)
-            stream = Stream(client)
-            print(f"music mode ({react} style) listening to {dev} at {fps:g} frames/s - Ctrl-C to stop",
-                  file=sys.stderr)
+        async with Group(devices, verbose) as g:
+            await g.write(cmd_power(True))
+            print(f"music mode ({react} style) on {g.names()}, listening to {dev} at {fps:g} frames/s"
+                  " - Ctrl-C to stop", file=sys.stderr)
             loop = asyncio.get_running_loop()
             t0 = loop.time()
             while not duration or loop.time() - t0 < duration:
@@ -934,7 +1095,7 @@ async def music(addr: str, source: str, react: str | None, fps: float, palette: 
                     rgb = palette[idx]
                 else:
                     rgb = (0, 0, 0)
-                await stream.send(cmd_music(*rgb, order=order))
+                await g.stream(lambda d, rgb=rgb: cmd_music(*rgb, order=d.order))
                 frames += 1
                 if verbose:
                     bar = "#" * max(0, min(40, int((d - 20) / 2))) if d > -1e9 else ""
@@ -1128,16 +1289,15 @@ def screen_color(frame: bytes, region: str = "full", saturation: float = 1.3,
     return r * 255, g * 255, b * 255
 
 
-async def screen_sync(addr: str, fps: float, smooth: float, region: str, saturation: float,
-                      floor: int, order: str, duration: float, verbose: bool) -> None:
+async def screen_sync(devices: list[Device], fps: float, smooth: float, region: str, saturation: float,
+                      floor: int, duration: float, verbose: bool) -> None:
     """Capture -> one colour per frame -> smooth fade at `fps` -> unacknowledged colour frames."""
     target: list[float] | None = None
-    async with ScreenCapture(fps, verbose) as cap, BleakClient(addr, timeout=15) as client:
-        await asyncio.sleep(0.3)
-        await client.write_gatt_char(WRITE_CHAR, cmd_power(True), response=True)
-        await client.write_gatt_char(WRITE_CHAR, cmd_brightness(100, 0x01), response=True)
-        stream = Stream(client)
-        print(f"screen sync at {fps:g} updates/s, fade {smooth:g}s - Ctrl-C to stop", file=sys.stderr)
+    async with ScreenCapture(fps, verbose) as cap, Group(devices, verbose) as g:
+        await g.write(cmd_power(True))
+        await g.write(cmd_brightness(100, 0x01))
+        print(f"screen sync on {g.names()} at {fps:g} updates/s, fade {smooth:g}s - Ctrl-C to stop",
+              file=sys.stderr)
 
         async def reader() -> None:
             nonlocal target
@@ -1165,7 +1325,7 @@ async def screen_sync(addr: str, fps: float, smooth: float, region: str, saturat
                     cur = list(target) if cur is None else [c + (t - c) * alpha for c, t in zip(cur, target)]
                     out = tuple(max(0, min(255, round(v))) for v in cur)
                     if out != last:
-                        await stream.send(cmd_color(*out, order=order))
+                        await g.stream(lambda d, out=out: cmd_color(*out, order=d.order))
                         last = out
                         frames += 1
                         if verbose:
@@ -1225,22 +1385,20 @@ ANIMATIONS = {
 }
 
 
-async def animate(addr: str, name: str, duration: float, period: float | None,
-                  color: tuple[int, int, int] | None, order: str, fps: float, verbose: bool,
+async def animate(devices: list[Device], name: str, duration: float, period: float | None,
+                  color: tuple[int, int, int] | None, fps: float, verbose: bool,
                   fast: bool = False) -> None:
     fn, default_period, default_color = ANIMATIONS[name]
     period = period or default_period
     base = color or default_color or (255, 255, 255)
-    async with BleakClient(addr, timeout=15) as client:
-        await asyncio.sleep(0.3)
-        w = lambda pkt: client.write_gatt_char(WRITE_CHAR, pkt, response=True)  # noqa: E731
-        await w(cmd_power(True))
-        await w(cmd_color(*_scale(base, 0.0) if name == "breathe" else base, order=order))
-        await w(cmd_brightness(100, 0x01))  # also drops out of any built-in effect
+    first = _scale(base, 0.0) if name == "breathe" else base
+    async with Group(devices, verbose) as g:
+        await g.write(cmd_power(True))
+        await g.write(lambda d: cmd_color(*first, order=d.order))
+        await g.write(cmd_brightness(100, 0x01))  # also drops out of any built-in effect
         loop = asyncio.get_running_loop()
         t0 = loop.time()
         frames, last = 0, None
-        stream = Stream(client, barrier=4 if fast else 1)
         print(f"animating {name!r} (period {period}s) - Ctrl-C to stop", file=sys.stderr)
         try:
             while True:
@@ -1249,7 +1407,8 @@ async def animate(addr: str, name: str, duration: float, period: float | None,
                     break
                 rgb = fn(now, period, base)
                 if rgb != last:
-                    await stream.send(cmd_color(*rgb, order=order))
+                    await g.stream(lambda d, rgb=rgb: cmd_color(*rgb, order=d.order),
+                                   barrier=4 if fast else 1)
                     last = rgb
                     frames += 1
                 nxt = t0 + (int(now * fps) + 1) / fps
@@ -1276,6 +1435,8 @@ def main() -> None:
                "  lightctl --screen                           # glow with the colour of the screen\n"
                "  lightctl --animate rainbow\n"
                "  lightctl --timer-on 07:30 --days weekdays --timer-off 23:00\n"
+               "  lightctl --add-device room BE:69:04:14:32:04   # save a second strip\n"
+               "  lightctl -D room --color blue               # only that strip (default: all saved)\n"
                "  lightctl --power off",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1288,7 +1449,8 @@ def main() -> None:
     e = p.add_argument_group("built-in effects (run on the controller)")
     e.add_argument("--mode", "-m", type=parse_mode, metavar="MODE",
                    help="effect name, tab:number (run:12), id (0xc1) or 'random'")
-    e.add_argument("--speed", "-s", type=parse_pct, metavar="0-100", help="effect speed (app default 100)")
+    e.add_argument("--speed", "-s", type=parse_pct, metavar="0-100",
+                   help=f"effect speed (app default 100; with several strips {SYNC_SPEED} unless given)")
     e.add_argument("--list-modes", nargs="?", const="", metavar="FILTER",
                    help="list effects, optionally filtered by word or tab")
     e.add_argument("--tour", nargs="?", const="", metavar="FILTER",
@@ -1356,12 +1518,16 @@ def main() -> None:
                    help="days for --timer-on/--timer-off: daily (default), weekdays, weekends, mon,wed,fri, mon-fri")
     s.add_argument("--timers", action="store_true", help="show the timers stored on the controller")
 
-    c = p.add_argument_group("connection & debugging")
-    c.add_argument("--addr", default=os.environ.get("LIGHTCTL_ADDR", DEFAULT_ADDR),
-                   help=f"device MAC (env LIGHTCTL_ADDR, default {DEFAULT_ADDR})")
+    c = p.add_argument_group("strips, connection & debugging")
+    c.add_argument("--device", "-D", "--addr", dest="targets", metavar="NAMES",
+                   help="which strips: saved names and/or MACs, comma-separated, or 'all' "
+                        "(default: every saved strip; env LIGHTCTL_ADDR)")
+    c.add_argument("--devices", action="store_true", help="list saved strips")
+    c.add_argument("--add-device", nargs=2, metavar=("NAME", "MAC"),
+                   help="save a strip under a name (add --order to record its wiring; default gbr)")
+    c.add_argument("--remove-device", metavar="NAME", help="forget a saved strip")
     c.add_argument("--order", type=parse_order,
-                   default=parse_order(os.environ.get("LIGHTCTL_ORDER", DEFAULT_ORDER)),
-                   help=f"strip channel wiring used for colours (env LIGHTCTL_ORDER, default {DEFAULT_ORDER})")
+                   help="colour wiring of the chosen strips, overriding what is saved (rgb, gbr, ...)")
     c.add_argument("--scan", action="store_true", help="find nearby LED controllers")
     c.add_argument("--raw", type=parse_raw, action="append", metavar="HEX",
                    help="send a raw 9-byte payload (repeatable)")
@@ -1377,14 +1543,39 @@ def main() -> None:
     if a.list_modes is not None:
         list_modes(a.list_modes or None)
         return
+    if a.devices:
+        list_devices()
+        return
+    if a.add_device:
+        name, mac = a.add_device
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", name) or name.lower() == "all" or MAC_RE.fullmatch(name):
+            p.error("--add-device: NAME may use letters, digits, - and _ (not 'all' or a MAC)")
+        if not MAC_RE.fullmatch(mac):
+            p.error(f"--add-device: {mac!r} is not a MAC address like BE:69:04:14:32:04")
+        saved = {k: v for k, v in load_devices().items() if v.addr != mac.upper() and k != name}
+        saved[name] = Device(name, mac.upper(), a.order or os.environ.get("LIGHTCTL_ORDER", DEFAULT_ORDER))
+        save_devices(saved)
+        print(f"saved {name!r} = {mac.upper()} (wiring {saved[name].order})")
+        list_devices()
+        return
+    if a.remove_device:
+        saved = load_devices()
+        if a.remove_device not in saved:
+            p.error(f"--remove-device: no saved strip called {a.remove_device!r}")
+        del saved[a.remove_device]
+        save_devices(saved)
+        print(f"forgot {a.remove_device!r}")
+        list_devices()
+        return
     if a.list_sources:
         list_sources()
         return
     if a.scan:
         run(scan(8))
         return
+    devices = resolve_targets(a.targets, a.order)
     if a.animate:
-        run(animate(a.addr, a.animate, a.duration, a.period, a.color, a.order,
+        run(animate(devices, a.animate, a.duration, a.period, a.color,
                     a.fps or 20, a.verbose, a.fast))
         return
     if a.screen_reset:
@@ -1398,7 +1589,7 @@ def main() -> None:
     if a.screen:
         if a.smooth < 0 or a.saturation < 0:
             p.error("--smooth and --saturation must not be negative")
-        run(screen_sync(a.addr, a.fps or 12, a.smooth, a.region, a.saturation, a.floor, a.order,
+        run(screen_sync(devices, a.fps or 12, a.smooth, a.region, a.saturation, a.floor,
                         a.duration, a.verbose))
         return
     if a.music and a.effect:
@@ -1413,25 +1604,25 @@ def main() -> None:
                 float(a.switch)
             except ValueError:
                 p.error("--switch must be a number of seconds or 'beat'")
-        run(music_effects(a.addr, a.music, a.fps or 10, a.effect, a.switch, a.speed, a.floor,
+        run(music_effects(devices, a.music, a.fps or 10, a.effect, a.switch, a.speed, a.floor,
                           a.duration, a.verbose))
         return
     if a.music:
-        run(music(a.addr, a.music, a.react, a.fps or 10, a.palette or MUSIC_PALETTE,
-                  a.threshold, a.order, a.duration, a.verbose))
+        run(music(devices, a.music, a.react, a.fps or 10, a.palette or MUSIC_PALETTE,
+                  a.threshold, a.duration, a.verbose))
         return
     if a.tour is not None:
-        run(tour(a.addr, a.tour or None, a.interval, a.speed, a.duration),
+        run(tour(devices, a.tour or None, a.interval, a.speed, a.duration, a.verbose),
             "stopped - the last effect listed keeps running")
         return
     if a.timers or a.timer_on is not None or a.timer_off is not None:
-        run(timers(a.addr, a.timer_on, a.timer_off, a.days, a.verbose))
+        run(timers(devices, a.timer_on, a.timer_off, a.days, a.verbose))
         return
     if a.sync_clock:
-        run(sync_clock(a.addr, a.verbose))
+        run(sync_clock(devices, a.verbose))
         return
 
-    packets: list[tuple[str, bytes]] = []
+    packets: list[tuple[str, object]] = []
     if a.power == "on":
         packets.append(("power on", cmd_power(True)))
     if a.set_wiring:
@@ -1439,9 +1630,11 @@ def main() -> None:
     if a.leds is not None:
         packets.append(("leds", cmd_leds(a.leds)))
     if a.color is not None:
-        packets.append(("color", cmd_color(*a.color, order=a.order)))
+        packets.append(("color", lambda d, c=a.color: cmd_color(*c, order=d.order)))
     if a.mode is not None:
         packets.append(("mode", cmd_mode(a.mode)))
+        if a.speed is None and len(devices) > 1:  # several strips: same speed so they move alike
+            packets.append(("speed", cmd_speed(SYNC_SPEED)))
     if a.speed is not None:
         packets.append(("speed", cmd_speed(a.speed)))
     if a.brightness is not None:
@@ -1469,7 +1662,7 @@ def main() -> None:
     if not packets:
         p.print_help()
         return
-    asyncio.run(send(a.addr, packets, a.verbose))
+    run(send(devices, packets, a.verbose))
 
 
 if __name__ == "__main__":
