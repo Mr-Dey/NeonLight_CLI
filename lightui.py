@@ -21,6 +21,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.color import Color
 from textual.containers import Grid, Horizontal, VerticalScroll
+from textual.css.query import NoMatches
 from textual.message import Message
 from textual.reactive import reactive
 from textual.widgets import (Button, Footer, Header, Input, Label, OptionList, RadioButton, RadioSet,
@@ -507,7 +508,7 @@ class LightUI(App):
                 return
 
     def set_switch(self, selector: str, value: bool) -> None:
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(NoMatches):  # the UI is closing: the switches are gone already
             sw = self.query_one(selector, Switch)
             if sw.value != value:
                 with self.prevent(Switch.Changed):

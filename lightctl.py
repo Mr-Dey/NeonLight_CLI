@@ -798,13 +798,13 @@ class LiveFeed:
         self.frames: collections.deque = collections.deque()  # (time, pkt), oldest first
         self.rtt: dict[Device, float] = {}
         self.tasks: dict[Device, asyncio.Task] = {}
-        self.wake: dict[Device, asyncio.Event] = {}
+        self.wake: dict[Device, asyncio.Event] = {}  # set on every new frame: senders wait on it
         self.closed = False
         self._hi_timer = False
         g.delivered = {}
 
     async def __aenter__(self) -> "LiveFeed":
-        if IS_WINDOWS and not self._hi_timer:
+        if IS_WINDOWS:  # asyncio's waits follow the 15.6 ms timer tick there: ask for 1 ms
             import winbackend
             self._hi_timer = winbackend.timer_resolution(True)
         return self
@@ -814,9 +814,6 @@ class LiveFeed:
 
     def push(self, pkt) -> None:
         """A new frame: the same bytes for every strip, or a function Device -> bytes (colours)."""
-        if IS_WINDOWS and not self._hi_timer and not self.closed:
-            import winbackend
-            self._hi_timer = winbackend.timer_resolution(True)
         now = time.monotonic()
         self.frames.append((now, pkt))
         while len(self.frames) > 2 and now - self.frames[1][0] > self.MAX_SKEW + 0.5:
@@ -1882,8 +1879,8 @@ def main() -> None:
         try:
             from lightui import run_ui
         except ImportError as e:
-            pip_cmd = r".venv\Scripts\pip" if IS_WINDOWS else ".venv/bin/pip"
-            raise SystemExit(f"lightctl: the UI needs Textual ({e}); run: {pip_cmd} install -r requirements.txt")
+            raise SystemExit(f"lightctl: the UI needs Textual ({e}); in the project folder run:\n"
+                             f'  "{sys.executable}" -m pip install -r requirements.txt')
         run_ui(a.targets, a.order)
         return
 

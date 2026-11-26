@@ -4,10 +4,12 @@ Windows-only libraries (soundcard, mss). Needs numpy and Pillow (installed on Wi
 Run:  .venv/bin/python -m unittest discover -s tests -v
 """
 import asyncio
+import builtins
 import math
 import os
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -158,42 +160,35 @@ class WindowsBackends(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(Exception):
                 L.parse_capture(bad)
 
-    def test_soundcard_imported_without_prior_com_init(self):
-        # soundcard.mediafoundation initializes COM at import time and fails if COM is already
-        # initialized on the importing thread; verify _import_soundcard() isolates the import.
-        import threading
+    def test_soundcard_imported_on_its_own_thread(self):
+        # soundcard's import calls CoInitializeEx and raises RuntimeError('Error 0x100000001') on a
+        # thread where COM is already set up, so winbackend imports it on a thread of its own.
         saved_sc = sys.modules.pop("soundcard", None)
-        saved_import = __builtins__["__import__"] if isinstance(__builtins__, dict) else __builtins__.__import__
-        import builtins
-        import_threads = []
-        fake = fake_soundcard()
+        saved_import, saved_com_init = builtins.__import__, W._com_init
+        fake, import_threads, com_threads = fake_soundcard(), [], []
 
-        def spy_import(name, globals=None, locals=None, fromlist=(), level=0):
+        def spy_import(name, *args, **kw):
             if name == "soundcard":
                 import_threads.append(threading.get_ident())
                 sys.modules["soundcard"] = fake
                 return fake
-            return saved_import(name, globals, locals, fromlist, level)
-
-        caller_threads = []
-        orig_com_init = W._com_init
+            return saved_import(name, *args, **kw)
 
         def spy_com_init():
-            caller_threads.append(threading.get_ident())
-            return orig_com_init()
+            com_threads.append(threading.get_ident())
+            return saved_com_init()
 
-        builtins.__import__ = spy_import
-        W._com_init = spy_com_init
+        builtins.__import__, W._com_init = spy_import, spy_com_init
         try:
             srcs = L.audio_sources()
         finally:
-            builtins.__import__ = saved_import
-            W._com_init = orig_com_init
+            builtins.__import__, W._com_init = saved_import, saved_com_init
+            sys.modules.pop("soundcard", None)
             if saved_sc is not None:
                 sys.modules["soundcard"] = saved_sc
         self.assertEqual(len(srcs), 2)
         self.assertEqual(len(import_threads), 1)
-        self.assertNotEqual(import_threads[0], caller_threads[0])
+        self.assertNotIn(import_threads[0], com_threads)  # not on the thread that set COM up
 
 
 @unittest.skipUnless(HAVE_DEPS, "needs numpy and Pillow")

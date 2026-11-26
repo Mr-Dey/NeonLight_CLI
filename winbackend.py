@@ -23,26 +23,23 @@ def _need(module: str, pip_name: str):
         return __import__(module)
     except ImportError:
         raise SystemExit(f"lightctl: this needs the '{pip_name}' package. In the project folder run:\n"
-                         "  .venv\\Scripts\\pip install -r requirements.txt") from None
+                         f'  "{sys.executable}" -m pip install -r requirements.txt') from None
 
 
 def _mss(mss_mod):
+    """A screen grabber: mss.MSS (mss.mss() is deprecated since mss 10.2), or mss.mss() on older mss."""
     return (getattr(mss_mod, "MSS", None) or mss_mod.mss)()
 
 
 def timer_resolution(enable: bool, ms: int = 1) -> bool:
-    """Request/release a finer Windows sleep timer tick (default ~15.6 ms -> 1 ms) while streaming."""
+    """Ask Windows for a 1 ms timer tick while streaming (the default is 15.6 ms), or give it back.
+    asyncio's waits on Windows follow this tick, so it keeps the strips' pacing precise."""
     if not IS_WINDOWS:
         return False
     with contextlib.suppress(Exception):
         fn = ctypes.windll.winmm.timeBeginPeriod if enable else ctypes.windll.winmm.timeEndPeriod
         return fn(ms) == 0
     return False
-    try:
-        return __import__(module)
-    except ImportError:
-        raise SystemExit(f"lightctl: this needs the '{pip_name}' package. In the project folder run:\n"
-                         "  .venv\\Scripts\\pip install -r requirements.txt") from None
 
 
 # ---------- COM: soundcard talks to WASAPI through COM, which must be initialised per thread ----------
