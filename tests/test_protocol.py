@@ -102,6 +102,20 @@ class MusicLogic(unittest.TestCase):
         self.assertIs(g(60.0), True)   # music well above the room -> colour
         self.assertIs(g(float("-inf")), False)  # digital silence never counts as sound
 
+    def test_level_norm(self):
+        n = L.LevelNorm(fps=10)
+        for _ in range(30):
+            n(50.0)
+        self.assertEqual(n(50.0), 0.0)        # at the quiet level
+        self.assertEqual(n(80.0), 1.0)        # a new peak
+        self.assertEqual(n(float("-inf")), 0.0)
+
+    def test_resolve_effect(self):
+        self.assertEqual(L.resolve_effect("7-color-running"), ("7-color-running", 0x67))
+        self.assertEqual(L.resolve_effect("run:1"), ("red-running", 0x59))
+        name, mid = L.resolve_effect("random")
+        self.assertEqual(L.MODES[name][1], mid)
+
     def test_level_db(self):
         import array
         self.assertEqual(L.level_db(array.array("h", [0] * 100).tobytes()), float("-inf"))

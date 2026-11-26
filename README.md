@@ -12,8 +12,8 @@ and [bleak](https://github.com/hbldh/bleak).
 - Power, RGB colour (name, hex or `R,G,B`), brightness
 - All 213 built-in effects from the app's Mode tab, by name, `tab:number` or id, with speed,
   plus `--tour` to browse them
-- **Music mode**: the app's crazy-fast beat strobe, driven by whatever the laptop is playing
-  or by any microphone (built-in, USB webcam, …)
+- **Music mode**: the app's crazy-fast beat strobe, or built-in animations pulsing with the music,
+  driven by whatever the laptop is playing or by any microphone (built-in, USB webcam, …)
 - The controller's own microphone mode (style, sensitivity)
 - On/off timers and clock, read back from the controller
 - Settings stored on the controller: wiring order, number of LEDs
@@ -69,6 +69,11 @@ lightctl --music mic --react mic              # calmer: the app's phone-mic beat
 lightctl --music --palette red purple blue    # your own colour cycle
 lightctl --music --fps 20                     # even faster than the app (10/s)
 
+# music + animation: built-in effects keep moving, brightness pulses with the music
+lightctl --music --effect 7-color-running
+lightctl --music --effect random --switch beat          # new animation on strong beats
+lightctl --music mic --effect flow:1 water:1 --switch 8 # rotate a playlist every 8 s
+
 # the controller's own microphone
 lightctl --mic on --mic-style spectrum --mic-sens 70
 lightctl --mic off
@@ -101,6 +106,16 @@ white) and each quiet frame goes dark. Frames use the app's music frame
   30 seconds, so the strip follows the room. Use `--threshold` for a fixed level.
 - `--react mic` switches to the app's phone-mic logic. It learns the background level
   and flashes only on sounds at least 5 dB louder.
+
+`--music --effect …` goes beyond the app. The controller can't take per-LED data, so
+the moving patterns come from its built-in effects, and the laptop streams brightness
+(`7e 04 01 BB ff …`) 10 times a second. Brightness follows the music between the
+recent quiet level (`--floor`, default 5 %) and the recent peak. `--switch beat`
+changes to the next effect on a strong beat (at most once a second), and
+`--switch 8` changes every 8 seconds.
+
+Not usable for music: the controller's own mic mode (`--mic on`) did not respond to sound
+on the tested unit, and changing its sensitivity in real time did not animate it.
 
 ## Protocol
 

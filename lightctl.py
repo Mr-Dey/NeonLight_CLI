@@ -788,6 +788,92 @@ class AutoGate:
         return d >= self.floor() + self.margin
 
 
+class LevelNorm:
+    """dB -> 0..1 between the recent quiet level (10th percentile, 5 s) and the recent peak (2 s)."""
+
+    def __init__(self, fps: float) -> None:
+        self.lo: collections.deque[float] = collections.deque(maxlen=max(5, int(fps * 5)))
+        self.hi: collections.deque[float] = collections.deque(maxlen=max(2, int(fps * 2)))
+
+    def __call__(self, d: float) -> float:
+        if d == float("-inf"):
+            return 0.0
+        self.lo.append(d)
+        self.hi.append(d)
+        lo = sorted(self.lo)[len(self.lo) // 10]
+        hi = max(max(self.hi), lo + 6)
+        return min(1.0, max(0.0, (d - lo) / (hi - lo)))
+
+
+def resolve_effect(spec: str) -> tuple[str, int]:
+    """Effect spec (name, tab:N, id, 'random') -> (label, id); 'random' is re-rolled on every call."""
+    if spec.strip().lower() == "random":
+        name = random.choice(list(MODES))
+        return name, MODES[name][1]
+    mid = parse_mode(spec)
+    name = next((n for n, (_, m) in MODES.items() if m == mid), f"0x{mid:02x}")
+    return name, mid
+
+
+async def music_effects(addr: str, source: str, fps: float, effects: list[str], switch: str | None,
+                        speed: int | None, floor: int, duration: float, verbose: bool) -> None:
+    """Built-in animation keeps running on the controller; the laptop pulses its brightness with the
+    music and can rotate effects every N seconds or on strong beats."""
+    dev, _ = pulse_source(source)
+    chunk = max(1, round(AUDIO_RATE / fps))
+    every = None if switch in (None, "beat") else float(switch)
+    proc = await asyncio.create_subprocess_exec(
+        "parec", "--raw", "--format=s16le", f"--rate={AUDIO_RATE}", "--channels=1",
+        f"--latency-msec={max(10, round(500 / fps))}", "-d", dev,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    norm = LevelNorm(fps)
+    pos = 0
+    try:
+        async with BleakClient(addr, timeout=15) as client:
+            await asyncio.sleep(0.3)
+            w = lambda pkt, ack=True: client.write_gatt_char(WRITE_CHAR, pkt, response=ack)  # noqa: E731
+
+            async def start(i: int) -> None:
+                name, mid = resolve_effect(effects[i % len(effects)])
+                print(f"effect: {name} (0x{mid:02x})", file=sys.stderr)
+                await w(cmd_mode(mid))
+
+            await w(cmd_power(True))
+            await w(cmd_mic(False))  # make sure the controller isn't in its own mic mode
+            await start(pos)
+            if speed is not None:
+                await w(cmd_speed(speed))
+            print(f"music + effect, listening to {dev} - Ctrl-C to stop", file=sys.stderr)
+            loop = asyncio.get_running_loop()
+            t0 = last_switch = loop.time()
+            last_v = None
+            while not duration or loop.time() - t0 < duration:
+                d = level_db(await proc.stdout.readexactly(chunk * 2))
+                x = norm(d)
+                now = loop.time()
+                beat = x >= 0.9 and now - last_switch >= 1.0
+                if (every and now - last_switch >= every) or (switch == "beat" and beat):
+                    pos += 1
+                    last_switch = now
+                    await start(pos)
+                v = round(floor + (100 - floor) * x)
+                if v != last_v:
+                    await w(cmd_brightness(v), ack=False)  # unacked stream, like the music frames
+                    last_v = v
+                if verbose:
+                    print(f"{d:6.1f} dB  level {x:4.2f}  brightness {v:3d}", file=sys.stderr)
+            await w(cmd_brightness(100))
+    except asyncio.IncompleteReadError:
+        err = (await proc.stderr.read()).decode(errors="replace").strip()
+        raise SystemExit(f"lightctl: audio capture from {dev!r} stopped: {err or 'parec exited'}") from None
+    except asyncio.CancelledError:
+        pass
+    finally:
+        if proc.returncode is None:
+            proc.terminate()
+            await proc.wait()
+
+
 async def music(addr: str, source: str, react: str | None, fps: float, palette: list,
                 threshold: float | None, order: str, duration: float, verbose: bool) -> None:
     dev, kind = pulse_source(source)  # kind: 'music' for laptop-audio monitors, 'mic' for microphones
@@ -942,6 +1028,7 @@ def main() -> None:
                "  lightctl --tour strobe                      # find effects you like\n"
                "  lightctl --music                            # react to what the laptop is playing\n"
                "  lightctl --music mic                        # react to the laptop microphone\n"
+               "  lightctl --music --effect random --switch beat   # animations pulsing with the music\n"
                "  lightctl --animate rainbow\n"
                "  lightctl --timer-on 07:30 --days weekdays --timer-off 23:00\n"
                "  lightctl --power off",
@@ -969,6 +1056,13 @@ def main() -> None:
                         "default), 'mic' (default mic, or $LIGHTCTL_MIC), or an input number / name / "
                         "part of a name from --list-sources (e.g. 'webcam', 'logitech')")
     m.add_argument("--list-sources", action="store_true", help="list microphones and other audio inputs")
+    m.add_argument("--effect", nargs="+", metavar="MODE",
+                   help="--music with animation: run built-in effect(s) and pulse their brightness with the "
+                        "music (names, tab:N, ids or 'random')")
+    m.add_argument("--switch", metavar="SECONDS|beat",
+                   help="with --effect: move to the next effect every N seconds, or on strong beats")
+    m.add_argument("--floor", type=parse_pct, default=5, metavar="0-100",
+                   help="with --effect: brightness between beats (default 5)")
     m.add_argument("--react", choices=["music", "mic"], default="music",
                    help="music (default) = app's Music tab: crazy-fast, a new colour every frame unless "
                         "quiet; mic = app's phone-mic mode: calmer, flashes only on sounds 5 dB above the room")
@@ -1034,6 +1128,21 @@ def main() -> None:
     if a.animate:
         run(animate(a.addr, a.animate, a.duration, a.period, a.color, a.order,
                     a.fps or 20, a.verbose, a.fast))
+        return
+    if a.music and a.effect:
+        for spec in a.effect:  # validate names before connecting
+            if spec.strip().lower() != "random":
+                try:
+                    parse_mode(spec)
+                except argparse.ArgumentTypeError as err:
+                    p.error(f"--effect: {err}")
+        if a.switch not in (None, "beat"):
+            try:
+                float(a.switch)
+            except ValueError:
+                p.error("--switch must be a number of seconds or 'beat'")
+        run(music_effects(a.addr, a.music, a.fps or 10, a.effect, a.switch, a.speed, a.floor,
+                          a.duration, a.verbose))
         return
     if a.music:
         run(music(a.addr, a.music, a.react, a.fps or 10, a.palette or MUSIC_PALETTE,
