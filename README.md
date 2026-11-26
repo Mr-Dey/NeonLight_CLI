@@ -9,6 +9,9 @@ and [bleak](https://github.com/hbldh/bleak).
 
 ## Features
 
+- **Interactive terminal UI**: run `lightctl` with no arguments to get tabs for everything, with
+  switches to turn modes on and off, sliders, and a searchable effect list. It stays connected,
+  so changes apply instantly
 - **Several strips at once**: every command, animation, music or screen frame goes to all
   saved strips at the same moment, each with its own wiring
 - Power, RGB colour (name, hex or `R,G,B`), brightness
@@ -53,6 +56,30 @@ Saved strips live in `~/.config/lightctl/devices.json`. Without any saved strips
 CLI uses `$LIGHTCTL_ADDR`, or `DEFAULT_ADDR` from the script.
 
 > Close the phone app first. The controller accepts only one BLE connection.
+
+## Terminal UI
+
+```bash
+lightctl            # or: lightctl --ui, or lightctl --ui -D monitor
+```
+
+| Tab | What's there |
+|-----|--------------|
+| 1 Light | power switch, brightness slider, colour swatches, custom colour |
+| 2 Effects | all 213 effects, filter by tab or search, Enter to play; speed; auto-tour switch |
+| 3 Music | music mode switch; strobe, calm or animated style; laptop audio or any mic; effect switching |
+| 4 Screen | screen sync switch; fade, colour boost, dark-scene glow, whole screen or edges |
+| 5 Animations | rainbow, breathe, fire or police, with speed |
+| 6 Timers | read, set and enable the on/off timers; sync clocks |
+| 7 Strips | include or leave out each strip; connection status; reconnect |
+
+Keys: `1`–`7` switch tabs, arrows move between items and change sliders, Enter/Space presses,
+`x` stops the running mode, `o` toggles power, `r` reconnects, `q` quits. The mouse works too.
+
+Only one mode (music, screen sync, animation or effect tour) runs at a time; turning one on
+switches the others off. The UI keeps one Bluetooth connection to every strip, so a colour change
+takes about 0.15 s instead of a 3–5 s reconnect per command. Settings are remembered in
+`~/.config/lightctl/ui.json`.
 
 ## Usage
 
@@ -228,6 +255,8 @@ export LIGHTCTL_ORDER=rgb             # make it permanent
 
 Every frame builder is checked byte for byte against values transcribed from the app's
 `BluetoothLEService`, along with the effect table, the music palette and the music logic.
+`tests/test_ui.py` drives the terminal UI headlessly with fake strips: colours, sliders, effect
+search, switching modes and leaving out a strip.
 
 ## How it was figured out
 

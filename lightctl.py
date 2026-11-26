@@ -29,6 +29,7 @@ import array
 import asyncio
 import collections
 import colorsys
+import contextlib
 import dataclasses
 import datetime as dt
 import json
@@ -40,6 +41,11 @@ import subprocess
 import sys
 
 from bleak import BleakClient, BleakScanner
+
+
+def log(msg: str, err: bool = True) -> None:
+    """Progress and warnings. The terminal UI (lightui.py) replaces this to show them in its own panel."""
+    print(msg, file=sys.stderr if err else sys.stdout, flush=True)
 
 DEFAULT_ADDR = "BE:69:32:13:B6:00"
 # Channel wiring of this strip, verified by hand: byte1 lights green, byte2 blue, byte3 red.
@@ -537,7 +543,7 @@ async def tour(devices: list[Device], filter_: str | None, interval: float, spee
                 items.append((f"{group}:{i}", name, mid))
     if not items:
         raise SystemExit(f"lightctl: no effects match {filter_!r} (see --list-modes)")
-    async with Group(devices, verbose) as g:
+    async with _connected(devices, verbose) as g:
         await g.write(cmd_power(True))
         if speed is None and len(g.live) > 1:
             speed = SYNC_SPEED
@@ -545,13 +551,12 @@ async def tour(devices: list[Device], filter_: str | None, interval: float, spee
             await g.write(cmd_speed(speed))
         loop = asyncio.get_running_loop()
         t0 = loop.time()
-        print(f"touring {len(items)} effects, {interval:g}s each - Ctrl-C keeps the current one",
-              file=sys.stderr)
+        log(f"touring {len(items)} effects, {interval:g}s each")
         try:
             for n, (ref, name, mid) in enumerate(items, 1):
                 if duration and loop.time() - t0 >= duration:
                     break
-                print(f"[{n:>3}/{len(items)}] {ref:<12} {name:<34} 0x{mid:02x}", flush=True)
+                log(f"[{n:>3}/{len(items)}] {ref:<12} {name:<34} 0x{mid:02x}", err=False)
                 await g.write(cmd_mode(mid))
                 await asyncio.sleep(interval)
         except asyncio.CancelledError:
@@ -626,6 +631,16 @@ def resolve_targets(spec: str | None, order: str | None = None) -> list[Device]:
     return uniq
 
 
+@contextlib.asynccontextmanager
+async def _connected(target, verbose: bool = False):
+    """A device list -> connect for the duration; an already connected Group (the UI) -> use it as is."""
+    if isinstance(target, Group):
+        yield target
+    else:
+        async with Group(target, verbose) as g:
+            yield g
+
+
 class Group:
     """Connections to one or more strips. Every write goes to all of them at the same moment
     (colours re-ordered for each strip's wiring). A strip that can't be reached, or drops out,
@@ -634,6 +649,7 @@ class Group:
     def __init__(self, devices: list[Device], verbose: bool = False) -> None:
         self.devices, self.verbose = devices, verbose
         self.clients: dict[Device, BleakClient] = {}
+        self.muted: set[str] = set()  # strip names temporarily left out (the UI's per-strip switches)
         self.n = 0
 
     @property
@@ -645,10 +661,33 @@ class Group:
 
     @staticmethod
     def _warn(d: Device, msg: str) -> None:
-        print(f"lightctl: {d.name}: {msg}", file=sys.stderr)
+        log(f"lightctl: {d.name}: {msg}")
 
     async def __aenter__(self) -> "Group":
-        want = {d.addr for d in self.devices}
+        await self._find_and_connect(self.devices)
+        if not self.clients:
+            raise SystemExit("lightctl: could not reach any strip.\n"
+                             "Hint: close the phone app (each strip accepts only one connection).")
+        await asyncio.sleep(0.3)  # let the controllers settle after connecting
+        return self
+
+    async def connect_missing(self) -> list[Device]:
+        """Try again for strips that are not connected (switched on later, back in range...)."""
+        missing = [d for d in self.devices if d not in self.clients]
+        if missing:
+            await self._find_and_connect(missing)
+            await asyncio.sleep(0.3)
+        return [d for d in missing if d in self.clients]
+
+    def prune(self) -> list[Device]:
+        """Forget strips whose connection has gone (e.g. switched off); returns them."""
+        gone = [d for d, c in self.clients.items() if not c.is_connected]
+        for d in gone:
+            self.clients.pop(d, None)
+        return gone
+
+    async def _find_and_connect(self, devices: list[Device]) -> None:
+        want = {d.addr for d in devices}
         found: dict[str, object] = {}
         all_found = asyncio.Event()
 
@@ -664,15 +703,10 @@ class Group:
                 await asyncio.wait_for(all_found.wait(), timeout=10)
             except asyncio.TimeoutError:
                 pass
-        for d in self.devices:
+        for d in devices:
             if d.addr not in found:
                 self._warn(d, "not found (switched off, out of range, or connected to the phone app?)")
-        await asyncio.gather(*(self._connect(d, found[d.addr]) for d in self.devices if d.addr in found))
-        if not self.clients:
-            raise SystemExit("lightctl: could not reach any strip.\n"
-                             "Hint: close the phone app (each strip accepts only one connection).")
-        await asyncio.sleep(0.3)  # let the controllers settle after connecting
-        return self
+        await asyncio.gather(*(self._connect(d, found[d.addr]) for d in devices if d.addr in found))
 
     async def _connect(self, d: Device, ble_device, retries: int = 3) -> None:
         last: Exception | None = None
@@ -701,7 +735,7 @@ class Group:
                 self.clients.pop(d, None)
                 self._warn(d, f"dropped: {e}")
 
-        await asyncio.gather(*(one(d, c) for d, c in list(self.clients.items())))
+        await asyncio.gather(*(one(d, c) for d, c in list(self.clients.items()) if d.name not in self.muted))
         if not self.clients:
             raise SystemExit("lightctl: lost the connection to every strip")
 
@@ -744,7 +778,7 @@ def list_devices() -> None:
 
 
 async def send(devices: list[Device], packets: list[tuple[str, object]], verbose: bool) -> None:
-    async with Group(devices, verbose) as g:
+    async with _connected(devices, verbose) as g:
         for label, pkt in packets:
             if verbose:
                 if callable(pkt):
@@ -786,7 +820,7 @@ def _timer_text(v: bytes | None) -> str:
 
 async def timers(devices: list[Device], set_on, set_off, days: int, verbose: bool) -> None:
     """Show both timers of every strip; set or disable them first if asked. Syncs the clock like the app."""
-    async with Group(devices, verbose) as g:
+    async with _connected(devices, verbose) as g:
         async def one(client: BleakClient) -> list[str]:
             out: list[str] = []
             w = lambda pkt: client.write_gatt_char(WRITE_CHAR, pkt, response=True)  # noqa: E731
@@ -821,7 +855,7 @@ async def timers(devices: list[Device], set_on, set_off, days: int, verbose: boo
 
 
 async def sync_clock(devices: list[Device], verbose: bool) -> None:
-    async with Group(devices, verbose) as g:
+    async with _connected(devices, verbose) as g:
         async def one(client: BleakClient) -> str:
             pkt = cmd_clock(dt.datetime.now())
             if verbose:
@@ -1012,10 +1046,10 @@ async def music_effects(devices: list[Device], source: str, fps: float, effects:
     norm = LevelNorm(fps)
     pos = 0
     try:
-        async with Group(devices, verbose) as g:
+        async with _connected(devices, verbose) as g:
             async def start(i: int) -> None:
                 name, mid = resolve_effect(effects[i % len(effects)])
-                print(f"effect: {name} (0x{mid:02x})", file=sys.stderr)
+                log(f"effect: {name} (0x{mid:02x})")
                 await g.write(cmd_mode(mid))
 
             await g.write(cmd_power(True))
@@ -1025,7 +1059,7 @@ async def music_effects(devices: list[Device], source: str, fps: float, effects:
                 speed = SYNC_SPEED
             if speed is not None:
                 await g.write(cmd_speed(speed))
-            print(f"music + effect on {g.names()}, listening to {dev} - Ctrl-C to stop", file=sys.stderr)
+            log(f"music + effect on {g.names()}, listening to {dev}")
             loop = asyncio.get_running_loop()
             t0 = last_switch = loop.time()
             last_v = None
@@ -1043,7 +1077,7 @@ async def music_effects(devices: list[Device], source: str, fps: float, effects:
                     await g.stream(cmd_brightness(v))
                     last_v = v
                 if verbose:
-                    print(f"{d:6.1f} dB  level {x:4.2f}  brightness {v:3d}", file=sys.stderr)
+                    log(f"{d:6.1f} dB  level {x:4.2f}  brightness {v:3d}")
             await g.write(cmd_brightness(100))
     except asyncio.IncompleteReadError:
         err = (await proc.stderr.read()).decode(errors="replace").strip()
@@ -1071,10 +1105,9 @@ async def music(devices: list[Device], source: str, react: str | None, fps: floa
     mic = MicReact() if react == "mic" else None
     idx, frames = 0, 0
     try:
-        async with Group(devices, verbose) as g:
+        async with _connected(devices, verbose) as g:
             await g.write(cmd_power(True))
-            print(f"music mode ({react} style) on {g.names()}, listening to {dev} at {fps:g} frames/s"
-                  " - Ctrl-C to stop", file=sys.stderr)
+            log(f"music mode ({react} style) on {g.names()}, listening to {dev} at {fps:g} frames/s")
             loop = asyncio.get_running_loop()
             t0 = loop.time()
             while not duration or loop.time() - t0 < duration:
@@ -1100,7 +1133,7 @@ async def music(devices: list[Device], source: str, react: str | None, fps: floa
                 if verbose:
                     bar = "#" * max(0, min(40, int((d - 20) / 2))) if d > -1e9 else ""
                     gate_txt = f" floor {gate.floor():5.1f}" if gate is not None else ""
-                    print(f"{d:6.1f} dB{gate_txt} {bar:<40} {'%02x%02x%02x' % rgb}", file=sys.stderr)
+                    log(f"{d:6.1f} dB{gate_txt} {bar:<40} {'%02x%02x%02x' % rgb}")
     except asyncio.IncompleteReadError:
         err = (await proc.stderr.read()).decode(errors="replace").strip()
         raise SystemExit(f"lightctl: audio capture from {dev!r} stopped: {err or 'parec exited'}") from None
@@ -1111,7 +1144,7 @@ async def music(devices: list[Device], source: str, react: str | None, fps: floa
             proc.terminate()
             await proc.wait()
         if verbose:
-            print(f"{frames} music frames sent", file=sys.stderr)
+            log(f"{frames} music frames sent")
 
 
 # ---------- screen sync: the strip glows with the colour of what's on screen ----------
@@ -1190,8 +1223,7 @@ class ScreenCapture:
             with open(TOKEN_FILE) as f:
                 opts["restore_token"] = Variant("s", f.read().strip())
         except OSError:
-            print("Your desktop will ask which screen to share: pick the monitor the strip is behind.",
-                  file=sys.stderr)
+            log("Your desktop will ask which screen to share: pick the monitor the strip is behind.")
         await self._request("SelectSources", "oa{sv}", [self.session], opts)
         res = await self._request("Start", "osa{sv}", [self.session, ""], {})
         if res.get("restore_token"):
@@ -1293,11 +1325,10 @@ async def screen_sync(devices: list[Device], fps: float, smooth: float, region: 
                       floor: int, duration: float, verbose: bool) -> None:
     """Capture -> one colour per frame -> smooth fade at `fps` -> unacknowledged colour frames."""
     target: list[float] | None = None
-    async with ScreenCapture(fps, verbose) as cap, Group(devices, verbose) as g:
+    async with ScreenCapture(fps, verbose) as cap, _connected(devices, verbose) as g:
         await g.write(cmd_power(True))
         await g.write(cmd_brightness(100, 0x01))
-        print(f"screen sync on {g.names()} at {fps:g} updates/s, fade {smooth:g}s - Ctrl-C to stop",
-              file=sys.stderr)
+        log(f"screen sync on {g.names()} at {fps:g} updates/s, fade {smooth:g}s")
 
         async def reader() -> None:
             nonlocal target
@@ -1329,14 +1360,14 @@ async def screen_sync(devices: list[Device], fps: float, smooth: float, region: 
                         last = out
                         frames += 1
                         if verbose:
-                            print(f"{'%02x%02x%02x' % out}", file=sys.stderr)
+                            log(f"{'%02x%02x%02x' % out}")
                 await asyncio.sleep(max(0.0, 1 / fps - (loop.time() - tick)))  # time spent sending counts
         except asyncio.CancelledError:
             pass
         finally:
             task.cancel()
             if verbose:
-                print(f"{frames} colour updates sent", file=sys.stderr)
+                log(f"{frames} colour updates sent")
 
 
 # ---------- host-driven animations (laptop streams colours over one connection) ----------
@@ -1392,14 +1423,14 @@ async def animate(devices: list[Device], name: str, duration: float, period: flo
     period = period or default_period
     base = color or default_color or (255, 255, 255)
     first = _scale(base, 0.0) if name == "breathe" else base
-    async with Group(devices, verbose) as g:
+    async with _connected(devices, verbose) as g:
         await g.write(cmd_power(True))
         await g.write(lambda d: cmd_color(*first, order=d.order))
         await g.write(cmd_brightness(100, 0x01))  # also drops out of any built-in effect
         loop = asyncio.get_running_loop()
         t0 = loop.time()
         frames, last = 0, None
-        print(f"animating {name!r} (period {period}s) - Ctrl-C to stop", file=sys.stderr)
+        log(f"animating {name!r} (period {period}s)")
         try:
             while True:
                 now = loop.time() - t0
@@ -1418,7 +1449,7 @@ async def animate(devices: list[Device], name: str, duration: float, period: flo
         finally:
             el = loop.time() - t0
             if verbose and el > 0:
-                print(f"{frames} frames in {el:.1f}s = {frames / el:.1f} fps", file=sys.stderr)
+                log(f"{frames} frames in {el:.1f}s = {frames / el:.1f} fps")
 
 
 def main() -> None:
@@ -1532,13 +1563,25 @@ def main() -> None:
     c.add_argument("--raw", type=parse_raw, action="append", metavar="HEX",
                    help="send a raw 9-byte payload (repeatable)")
     c.add_argument("-v", "--verbose", action="store_true", help="print bytes sent / audio levels")
+    c.add_argument("--ui", action="store_true", help="open the interactive terminal UI (same as no arguments)")
+    if len(sys.argv) == 1 and sys.stdin.isatty() and sys.stdout.isatty():
+        sys.argv.append("--ui")
     a = p.parse_args()
+    if a.ui:
+        try:
+            from lightui import run_ui
+        except ImportError as e:
+            raise SystemExit(f"lightctl: the UI needs Textual ({e}); run: .venv/bin/pip install -r requirements.txt")
+        run_ui(a.targets, a.order)
+        return
 
     def run(coro, stopped_msg: str = "stopped") -> None:
+        if a.animate or a.music or a.screen or a.tour is not None:
+            log("(Ctrl-C to stop)")
         try:
             asyncio.run(coro)
         except KeyboardInterrupt:
-            print(stopped_msg, file=sys.stderr)
+            log(stopped_msg)
 
     if a.list_modes is not None:
         list_modes(a.list_modes or None)
