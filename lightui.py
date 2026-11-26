@@ -208,8 +208,8 @@ class LightUI(App):
         self.sent: dict[str, object] = {}
         self.connecting = False
         self._closed = False
-        self.rate: float | None = None  # stream frames per second actually sent while a mode runs
-        self._rate_mark: tuple[float, int] | None = None
+        self.rates: dict[str, float] = {}  # updates per second each strip really gets while a mode runs
+        self._rate_mark: tuple[float, dict] | None = None
 
     # ---------- layout ----------
 
@@ -447,7 +447,7 @@ class LightUI(App):
             else:
                 parts.append(f"[red]●[/] {d.name}" + (" [dim]connecting…[/]" if self.connecting else ""))
         mode = self.MODE_NAMES.get(self.mode_name or "", "")
-        rate = f" · {self.rate:.1f} updates/s" if mode and self.rate else ""
+        rate = "".join(f" · {k} {v:.1f}/s" for k, v in self.rates.items()) if mode else ""
         status = "   ".join(parts) + ("   │   [b]" + mode + "[/] running" + rate + "  (x to stop)" if mode else "")
         with contextlib.suppress(Exception):
             self.query_one("#status", Static).update(status)
@@ -477,12 +477,13 @@ class LightUI(App):
         for d in self.group.prune():
             self.log_line(f"lightctl: {d.name}: connection lost (press r to reconnect)")
         now = asyncio.get_running_loop().time()
-        if self.mode_name and self._rate_mark is not None:
-            t0, n0 = self._rate_mark
-            self.rate = (self.group.n - n0) / (now - t0) if now > t0 else None
+        snap = dict(self.group.delivered)
+        if self.mode_name and self._rate_mark is not None and now > self._rate_mark[0]:
+            t0, before = self._rate_mark
+            self.rates = {k: max(0, v - before.get(k, 0)) / (now - t0) for k, v in snap.items()}
         else:
-            self.rate = None
-        self._rate_mark = (now, self.group.n) if self.mode_name else None
+            self.rates = {}
+        self._rate_mark = (now, snap) if self.mode_name else None
         self.refresh_status()
 
     # ---------- helpers ----------

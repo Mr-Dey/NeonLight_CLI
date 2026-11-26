@@ -684,10 +684,7 @@ class Group:
         self.devices, self.verbose = devices, verbose
         self.clients: dict[Device, BleakClient] = {}
         self.muted: set[str] = set()  # strip names temporarily left out (the UI's per-strip switches)
-        self.n = 0                    # stream frames sent (each goes to every strip)
-        self.link_dt = 0.0            # measured seconds per stream frame when the link is the bottleneck
-        self._barrier_t: float | None = None
-        self._barrier_task: asyncio.Task | None = None
+        self.delivered: dict[str, int] = {}  # stream frames each strip received (the UI shows the rate)
 
     @property
     def live(self) -> list[Device]:
@@ -761,8 +758,6 @@ class Group:
         self._warn(d, f"could not connect: {last}")
 
     async def __aexit__(self, *exc) -> None:
-        if self._barrier_task is not None:
-            self._barrier_task.cancel()
         await asyncio.gather(*(c.disconnect() for c in self.clients.values()), return_exceptions=True)
 
     async def write(self, pkt, ack: bool = True) -> None:
@@ -778,49 +773,108 @@ class Group:
         if not self.clients:
             raise SystemExit("lightctl: lost the connection to every strip")
 
-    async def stream(self, pkt, barrier: int = 5) -> None:
-        """Fast writes for animations, music and screen sync without lag building up.
 
-        Each link carries only ~10-16 writes/s (the strips ask for a ~75 ms connection interval).
-        Unacknowledged writes are accepted instantly and queue up, so streaming faster than that makes
-        a strip fall further and further behind. So after every `barrier` frames an acknowledged
-        no-op (a timer query, as the app sends: nothing visible changes) is written in the
-        background. It returns once everything queued before it was delivered: the time between
-        those answers is what the link really delivers (see pace()), and a new one only starts
-        after the previous one answered, so at most ~2 x `barrier` frames are ever waiting.
-        barrier=1 makes every frame an acknowledged write instead (slow, but nothing queues).
-        """
-        self.n += 1
-        if barrier <= 1:
-            await self.write(pkt, ack=True)
-            return
-        await self.write(pkt, ack=False)
-        if self.n % barrier == 0:
-            if self._barrier_task is not None and not self._barrier_task.done():
-                await self._barrier_task  # backpressure: the link is behind
-            self._barrier_task = asyncio.create_task(self._barrier(barrier))
+class LiveFeed:
+    """Continuous streams (screen sync, music, animations) to every strip, in step.
 
-    async def _barrier(self, frames: int) -> None:
-        try:
-            await self.write(cmd_timer_query(TIMER_ON), ack=True)
-        except SystemExit:  # every strip gone: the next stream write reports it
-            return
+    Every strip has its own sender that always takes the newest frame, paced by its own link, so no
+    strip ever carries a backlog. (Sending each frame to every strip at one shared pace left the slower
+    link with a standing queue, which made that strip trail the other.)
+
+    The link takes about one write per connection event, and an acknowledged write's round trip is
+    about two events. So one write in `ack_every` is acknowledged to measure that round trip, and the
+    writes in between are spaced at UTILISATION of what the link can carry: frames go out almost as
+    fast as possible but never queue up. ack_every=1 acknowledges every write (slower, no estimate).
+    With `align`, a strip whose link answers faster is handed a correspondingly older frame (up to
+    MAX_SKEW), so all strips change colour at the same moment.
+    """
+
+    MAX_SKEW = 0.3
+    UTILISATION = 0.8
+
+    def __init__(self, g: Group, ack_every: int = 8, align: bool = True) -> None:
+        self.g, self.ack_every, self.align = g, max(1, ack_every), align
+        self.frames: collections.deque = collections.deque()  # (time, pkt), oldest first
+        self.rtt: dict[Device, float] = {}
+        self.tasks: dict[Device, asyncio.Task] = {}
+        self.closed = False
+        g.delivered = {}
+
+    async def __aenter__(self) -> "LiveFeed":
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        await self.close()
+
+    def push(self, pkt) -> None:
+        """A new frame: the same bytes for every strip, or a function Device -> bytes (colours)."""
         now = time.monotonic()
-        if self._barrier_t is not None and now - self._barrier_t < 1.5:  # ignore idle gaps
-            dt_ = (now - self._barrier_t) / frames
-            self.link_dt = dt_ if self.link_dt == 0 else 0.8 * self.link_dt + 0.2 * dt_
-        self._barrier_t = now
+        self.frames.append((now, pkt))
+        while len(self.frames) > 2 and now - self.frames[1][0] > self.MAX_SKEW + 0.5:
+            self.frames.popleft()
+        for d, c in list(self.g.clients.items()):
+            task = self.tasks.get(d)
+            if task is None or task.done():
+                self.tasks[d] = asyncio.create_task(self._sender(d, c))
 
-    async def drain(self) -> None:
-        """Wait for the last background acknowledgement (end of a stream)."""
-        if self._barrier_task is not None:
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._barrier_task
+    def latency(self, d: Device) -> float:
+        """Typical delay until this strip shows a frame: on average half a connection event when
+        writes are paced, a whole one when every write waits for its acknowledgement."""
+        return self.rtt[d] / (2 if self.ack_every == 1 else 4)
 
-    def pace(self, fps: float) -> float:
-        """Seconds until the next stream frame: the requested rate, but not faster than the link has
-        been delivering (probing 10 % above it, so a faster link is picked up again)."""
-        return max(1 / fps, 0.9 * self.link_dt)
+    def holdback(self, d: Device) -> float:
+        """How much older a frame this strip gets, so it shows it when the slowest strip does."""
+        if not self.align or d not in self.rtt:
+            return 0.0
+        lats = [self.latency(dev) for dev in self.rtt if dev in self.g.clients and dev.name not in self.g.muted]
+        return min(self.MAX_SKEW, max(0.0, max(lats) - self.latency(d))) if lats else 0.0
+
+    def _pick(self, d: Device) -> tuple:
+        cutoff = time.monotonic() - self.holdback(d)
+        pick = self.frames[0]
+        for frame in self.frames:  # oldest -> newest: the newest one that is old enough
+            if frame[0] > cutoff:
+                break
+            pick = frame
+        return pick
+
+    async def _sender(self, d: Device, c: BleakClient) -> None:
+        sent_t: float | None = None
+        last_send, n = 0.0, 0
+        while not self.closed and self.g.clients.get(d) is c:
+            if d.name in self.g.muted or not self.frames:
+                await asyncio.sleep(0.01)
+                continue
+            gap = self.rtt.get(d, 0.0) / 2 / self.UTILISATION  # one connection event, with headroom
+            wait = last_send + gap - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(min(wait, 0.05))
+                continue
+            t, pkt = self._pick(d)
+            if sent_t is not None and t <= sent_t:  # nothing newer for this strip yet
+                await asyncio.sleep(0.005)
+                continue
+            n += 1
+            ack = d not in self.rtt or n % self.ack_every == 0  # the first write measures the link
+            last_send = time.monotonic()
+            try:
+                await c.write_gatt_char(WRITE_CHAR, pkt(d) if callable(pkt) else pkt, response=ack)
+            except Exception as e:  # noqa: BLE001 - bleak raises a mix of types
+                if self.g.clients.get(d) is c:
+                    self.g.clients.pop(d, None)
+                    Group._warn(d, f"dropped: {e}")
+                return
+            if ack:
+                r = time.monotonic() - last_send
+                self.rtt[d] = r if d not in self.rtt else 0.7 * self.rtt[d] + 0.3 * r
+            sent_t = t
+            self.g.delivered[d.name] = self.g.delivered.get(d.name, 0) + 1
+
+    async def close(self) -> None:
+        self.closed = True
+        for task in self.tasks.values():
+            task.cancel()
+        await asyncio.gather(*self.tasks.values(), return_exceptions=True)
 
 
 async def scan(seconds: float) -> None:
@@ -1180,7 +1234,6 @@ async def music_effects(devices: list[Device], source: str, fps: float, effects:
     music and can rotate effects every N seconds or on strong beats."""
     every = None if switch in (None, "beat") else float(switch)
     norm = LevelNorm(fps)
-    pos = 0
     try:
         async with AudioInput(source, fps) as audio, _connected(devices, verbose) as g:
             async def start(i: int) -> None:
@@ -1188,6 +1241,7 @@ async def music_effects(devices: list[Device], source: str, fps: float, effects:
                 log(f"effect: {name} (0x{mid:02x})")
                 await g.write(cmd_mode(mid))
 
+            pos = 0
             await g.write(cmd_power(True))
             await g.write(cmd_mic(False))  # make sure the controller isn't in its own mic mode
             await start(pos)
@@ -1199,21 +1253,22 @@ async def music_effects(devices: list[Device], source: str, fps: float, effects:
             loop = asyncio.get_running_loop()
             t0 = last_switch = loop.time()
             last_v = None
-            while not duration or loop.time() - t0 < duration:
-                d = await audio.level()
-                x = norm(d)
-                now = loop.time()
-                beat = x >= 0.9 and now - last_switch >= 1.0
-                if (every and now - last_switch >= every) or (switch == "beat" and beat):
-                    pos += 1
-                    last_switch = now
-                    await start(pos)
-                v = round(floor + (100 - floor) * x)
-                if v != last_v:
-                    await g.stream(cmd_brightness(v))
-                    last_v = v
-                if verbose:
-                    log(f"{d:6.1f} dB  level {x:4.2f}  brightness {v:3d}")
+            async with LiveFeed(g) as feed:
+                while not duration or loop.time() - t0 < duration:
+                    d = await audio.level()
+                    x = norm(d)
+                    now = loop.time()
+                    beat = x >= 0.9 and now - last_switch >= 1.0
+                    if (every and now - last_switch >= every) or (switch == "beat" and beat):
+                        pos += 1
+                        last_switch = now
+                        await start(pos)
+                    v = round(floor + (100 - floor) * x)
+                    if v != last_v:
+                        feed.push(cmd_brightness(v))
+                        last_v = v
+                    if verbose:
+                        log(f"{d:6.1f} dB  level {x:4.2f}  brightness {v:3d}")
             await g.write(cmd_brightness(100))
     except asyncio.CancelledError:
         pass
@@ -1233,29 +1288,30 @@ async def music(devices: list[Device], source: str, react: str | None, fps: floa
             log(f"music mode ({react} style) on {g.names()}, listening to {audio.desc} at {fps:g} frames/s")
             loop = asyncio.get_running_loop()
             t0 = loop.time()
-            while not duration or loop.time() - t0 < duration:
-                d = await audio.level()
-                if mic is not None:
-                    loud = mic(d)
-                    if loud is None:
-                        continue
-                elif gate is not None:  # Music-tab logic on a microphone: above the room's quiet level
-                    loud = gate(d)
-                    if loud is None:
-                        continue
-                else:  # Music-tab logic: a new colour every frame unless (near) silent
-                    loud = d >= limit
-                if loud:
-                    idx = (idx + 1) % len(palette)  # the app advances the palette, then uses it
-                    rgb = palette[idx]
-                else:
-                    rgb = (0, 0, 0)
-                await g.stream(lambda dev, rgb=rgb: cmd_music(*rgb, order=dev.order))
-                frames += 1
-                if verbose:
-                    bar = "#" * max(0, min(40, int((d - 20) / 2))) if d > -1e9 else ""
-                    gate_txt = f" floor {gate.floor():5.1f}" if gate is not None else ""
-                    log(f"{d:6.1f} dB{gate_txt} {bar:<40} {'%02x%02x%02x' % rgb}")
+            async with LiveFeed(g) as feed:
+                while not duration or loop.time() - t0 < duration:
+                    d = await audio.level()
+                    if mic is not None:
+                        loud = mic(d)
+                        if loud is None:
+                            continue
+                    elif gate is not None:  # Music-tab logic on a microphone: above the room's quiet level
+                        loud = gate(d)
+                        if loud is None:
+                            continue
+                    else:  # Music-tab logic: a new colour every frame unless (near) silent
+                        loud = d >= limit
+                    if loud:
+                        idx = (idx + 1) % len(palette)  # the app advances the palette, then uses it
+                        rgb = palette[idx]
+                    else:
+                        rgb = (0, 0, 0)
+                    feed.push(lambda dev, rgb=rgb: cmd_music(*rgb, order=dev.order))
+                    frames += 1
+                    if verbose:
+                        bar = "#" * max(0, min(40, int((d - 20) / 2))) if d > -1e9 else ""
+                        gate_txt = f" floor {gate.floor():5.1f}" if gate is not None else ""
+                        log(f"{d:6.1f} dB{gate_txt} {bar:<40} {'%02x%02x%02x' % rgb}")
     except asyncio.CancelledError:
         pass
     finally:
@@ -1546,35 +1602,36 @@ async def screen_sync(devices: list[Device], fps: float, smooth: float, region: 
 
         task = asyncio.create_task(reader())
         loop = asyncio.get_running_loop()
-        t0 = loop.time()
-        last_t = t0
+        t0 = last_t = loop.time()
+        rate = max(fps, 25)  # colours are worked out often; each strip takes the newest when it can
         cur: list[float] | None = None
         last: tuple[int, int, int] | None = None
         frames = 0
         try:
-            while not duration or loop.time() - t0 < duration:
-                tick = loop.time()
-                if task.done():
-                    task.result()  # re-raise capture errors
-                # fade by the real time since the last update (the link may run slower than fps)
-                alpha = 1 - math.exp(-(tick - last_t) / smooth) if smooth > 0 else 1.0
-                last_t = tick
-                if target is not None:
-                    cur = list(target) if cur is None else [c + (t - c) * alpha for c, t in zip(cur, target)]
-                    out = tuple(max(0, min(255, round(v))) for v in cur)
-                    if out != last:
-                        await g.stream(lambda d, out=out: cmd_color(*out, order=d.order))
-                        last = out
-                        frames += 1
-                        if verbose:
-                            log(f"{'%02x%02x%02x' % out}")
-                await asyncio.sleep(max(0.0, g.pace(fps) - (loop.time() - tick)))  # sending time counts
+            async with LiveFeed(g) as feed:
+                while not duration or loop.time() - t0 < duration:
+                    tick = loop.time()
+                    if task.done():
+                        task.result()  # re-raise capture errors
+                    # fade by the real time since the last step
+                    alpha = 1 - math.exp(-(tick - last_t) / smooth) if smooth > 0 else 1.0
+                    last_t = tick
+                    if target is not None:
+                        cur = list(target) if cur is None else [c + (t - c) * alpha for c, t in zip(cur, target)]
+                        out = tuple(max(0, min(255, round(v))) for v in cur)
+                        if out != last:
+                            feed.push(lambda d, out=out: cmd_color(*out, order=d.order))
+                            last = out
+                            frames += 1
+                            if verbose:
+                                log(f"{'%02x%02x%02x' % out}")
+                    await asyncio.sleep(max(0.0, 1 / rate - (loop.time() - tick)))
         except asyncio.CancelledError:
             pass
         finally:
             task.cancel()
             if verbose:
-                log(f"{frames} colour updates sent")
+                log(f"{frames} colours worked out; per strip sent: {g.delivered}")
 
 
 # ---------- host-driven animations (laptop streams colours over one connection) ----------
@@ -1639,23 +1696,24 @@ async def animate(devices: list[Device], name: str, duration: float, period: flo
         frames, last = 0, None
         log(f"animating {name!r} (period {period}s)")
         try:
-            while True:
-                now = loop.time() - t0
-                if duration and now >= duration:
-                    break
-                rgb = fn(now, period, base)
-                if rgb != last:
-                    await g.stream(lambda d, rgb=rgb: cmd_color(*rgb, order=d.order),
-                                   barrier=5 if fast else 1)
-                    last = rgb
-                    frames += 1
-                await asyncio.sleep(max(0.0, g.pace(fps) - (loop.time() - t0 - now)))
+            async with LiveFeed(g, ack_every=8 if fast else 1) as feed:
+                while True:
+                    now = loop.time() - t0
+                    if duration and now >= duration:
+                        break
+                    rgb = fn(now, period, base)
+                    if rgb != last:
+                        feed.push(lambda d, rgb=rgb: cmd_color(*rgb, order=d.order))
+                        last = rgb
+                        frames += 1
+                    await asyncio.sleep(max(0.0, 1 / fps - (loop.time() - t0 - now)))
         except asyncio.CancelledError:
             pass
         finally:
             el = loop.time() - t0
             if verbose and el > 0:
-                log(f"{frames} frames in {el:.1f}s = {frames / el:.1f} fps")
+                log(f"{frames} frames in {el:.1f}s; per strip sent: "
+                    + ", ".join(f"{k} {v / el:.1f}/s" for k, v in g.delivered.items()))
 
 
 def main() -> None:
@@ -1753,7 +1811,7 @@ def main() -> None:
                     help="target updates per second (default: 20 for --animate, 12 for --screen, 10 for --music "
                          "like the app). Streams never go faster than the Bluetooth link delivers (~13/s here)")
     a_.add_argument("--fast", action="store_true",
-                    help="--animate: mostly unacknowledged writes (about 13 updates/s instead of 6)")
+                    help="--animate: pace writes by the link instead of acknowledging each (more updates/s)")
 
     s = p.add_argument_group("settings stored on the controller")
     s.add_argument("--set-wiring", type=parse_order, metavar="ORDER",

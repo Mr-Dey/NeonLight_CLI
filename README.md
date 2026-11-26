@@ -236,6 +236,11 @@ Built-in effects are drawn by each controller itself, so for them to match:
 - Each controller starts an effect when its command arrives, so strips can be up to one
   connection interval (about 75 ms) apart.
 
+Streams (screen sync, music, animations) are different: every strip has its own sender that
+always takes the newest frame, paced by its own link, and faster links are handed a slightly
+older frame so all strips change together (see "Protocol" below). The terminal UI's top bar
+shows the updates per second each strip really gets.
+
 ## Music mode
 
 `--music` does what the app's Music tab does. About 10 times a second it measures
@@ -307,14 +312,19 @@ GATT service `fff0`, write characteristic `fff3`. Each command is 9 bytes,
 silently dropped).
 
 Streams (music, screen, animations) are limited by the link: the strips ask for a ~75-90 ms
-connection interval, so only **about 10-16 writes/s** get through (it varies with the radio
-environment). Unacknowledged writes queue up instantly, and streaming faster than the link
-makes a strip lag further and further behind. So streams write frames unacknowledged and,
-every 5 frames, an acknowledged no-op (a timer query) in the background: its answer comes back
-once the queue has drained. The time between answers is what the link really delivers, and
-streams pace themselves to it (probing 10 % faster), so `--fps 60` simply runs as fast as the
-link allows without building up lag. `tools/linkspeed.py` (run with sudo) shows the negotiated
-interval and tries a faster one.
+connection interval and take about one write per interval, so only **about 10-13 writes/s**
+get through (it varies with the radio environment). Unacknowledged writes queue up instantly,
+so sending faster than that makes a strip lag further and further behind.
+
+So every strip gets its own sender (`LiveFeed`). The mode (screen, music, animation) just
+publishes the newest frame. Each sender takes the newest frame whenever its own link has
+room, so no strip ever carries a backlog. One write in 8 is acknowledged; its round trip is
+about two connection intervals, which tells the sender how far apart to space the
+unacknowledged writes in between (at 80 % of what that link carries). The round trips also
+show how late each strip displays a frame: a strip whose link answers faster gets a
+correspondingly older frame, so all strips change colour at the same moment.
+Measured on the two test strips: 9-10 updates/s each, aligned to within ~15 ms on average.
+`tools/linkspeed.py` (run with sudo) shows the negotiated interval and tries a faster one.
 
 | Action          | Frame                                   | Notes                                       |
 |-----------------|-----------------------------------------|---------------------------------------------|

@@ -4,6 +4,7 @@ Each expected value is transcribed from com.easylink.colorful.service.BluetoothL
 (Java bytes are signed: -1 = ff, -17 = ef, -125 = 83, -126 = 82, -127 = 81).
 Run:  .venv/bin/python -m unittest -v
 """
+import asyncio
 import datetime as dt
 import unittest
 
@@ -219,20 +220,6 @@ class GroupWrites(unittest.TestCase):
         import asyncio
         asyncio.run(coro)
 
-    def test_stream_frames_unacked_with_background_noop_ack(self):
-        g = self.group("rgb")
-
-        async def go():
-            for i in range(10):
-                await g.stream(bytes([i]), barrier=5)
-            await g.drain()
-        self.run_async(go())
-        writes = next(iter(g.clients.values())).writes
-        frames = [d for d, ack in writes if not ack]
-        acks = [d for d, ack in writes if ack]
-        self.assertEqual(frames, [bytes([i]) for i in range(10)])    # every frame, in order, unacknowledged
-        self.assertEqual(acks, [L.cmd_timer_query(L.TIMER_ON)] * 2)  # one harmless ack per 5 frames
-
     def test_same_moment_each_strips_own_wiring(self):
         g = self.group("gbr", "rgb")
         self.run_async(g.write(lambda d: L.cmd_color(255, 0, 0, order=d.order)))
@@ -240,34 +227,67 @@ class GroupWrites(unittest.TestCase):
         self.assertEqual(a[4:7], bytes([0, 0, 255]))   # gbr strip: red is the 3rd byte
         self.assertEqual(b[4:7], bytes([255, 0, 0]))   # rgb strip: red is the 1st byte
 
-    def test_pacing_follows_the_link(self):
-        import asyncio
-
-        class SlowLink(FakeClient):  # every acknowledged write waits for a 0.2 s queue drain
-            async def write_gatt_char(self, char, data, response):
-                await super().write_gatt_char(char, data, response)
-                if response:
-                    await asyncio.sleep(0.2)
-
-        g = L.Group([])
-        d = L.Device("s", "AA:BB:CC:DD:EE:09", "rgb")
-        g.devices.append(d)
-        g.clients[d] = SlowLink()
-        self.assertAlmostEqual(g.pace(60), 1 / 60)  # nothing measured yet: the requested rate
-
-        async def go():
-            for _ in range(24):
-                await g.stream(b"x", barrier=4)
-            await g.drain()
-        self.run_async(go())
-        self.assertAlmostEqual(g.link_dt, 0.05, delta=0.01)  # answers 0.2 s apart, 4 frames each
-        self.assertAlmostEqual(g.pace(60), 0.045, delta=0.01)  # 10 % above what the link delivers
-        self.assertAlmostEqual(g.pace(5), 0.2)                 # slower requests are kept
-
     def test_plain_bytes_go_to_everyone(self):
         g = self.group("gbr", "gbr")
         self.run_async(g.write(L.cmd_power(True)))
         self.assertTrue(all(c.writes == [(L.cmd_power(True), True)] for c in g.clients.values()))
+
+
+class TimedLink(FakeClient):
+    """A fake strip whose acknowledged writes take `rtt` seconds; remembers when each frame was sent."""
+
+    def __init__(self, rtt):
+        super().__init__()
+        self.rtt, self.sent = rtt, []
+
+    async def write_gatt_char(self, char, data, response):
+        import time
+        self.sent.append((time.monotonic(), data[0]))
+        await super().write_gatt_char(char, data, response)
+        if response:
+            await asyncio.sleep(self.rtt)
+
+
+class Feed(unittest.TestCase):
+    """Two strips with different link speeds: neither may build a backlog, each is paced by its own
+    link, and with alignment both show each frame at (nearly) the same moment."""
+
+    def run_feed(self, align, ack_every):
+        import time
+
+        async def go():
+            g = L.Group([])
+            fast, slow = L.Device("fast", "AA:BB:CC:DD:EE:01", "rgb"), L.Device("slow", "AA:BB:CC:DD:EE:02", "rgb")
+            g.devices += [fast, slow]
+            g.clients = {fast: TimedLink(0.02), slow: TimedLink(0.10)}
+            born = {}
+            async with L.LiveFeed(g, ack_every=ack_every, align=align) as feed:
+                for i in range(150):  # a new frame every 10 ms for 1.5 s
+                    born[i % 256] = time.monotonic()
+                    feed.push(bytes([i % 256]))
+                    await asyncio.sleep(0.01)
+            # an acknowledged write reaches the strip halfway through its round trip
+            late = {d.name: [t + c.rtt / 2 - born[i] for t, i in c.sent[3:]] for d, c in g.clients.items()}
+            return ({k: sum(v) / len(v) for k, v in late.items()},
+                    {d.name: len(c.sent) for d, c in g.clients.items()})
+        return asyncio.run(go())
+
+    def test_no_backlog_on_the_slow_link(self):
+        late, counts = self.run_feed(align=False, ack_every=1)
+        self.assertLess(late["slow"], 0.05 + 0.03)  # always the newest frame: half a round trip, no queue
+        self.assertGreater(counts["fast"], 2 * counts["slow"])  # each link runs at its own pace
+
+    def test_strips_change_together(self):
+        unaligned, _ = self.run_feed(align=False, ack_every=1)
+        aligned, _ = self.run_feed(align=True, ack_every=1)
+        self.assertGreater(abs(unaligned["fast"] - unaligned["slow"]), 0.03)  # 20 ms vs 100 ms links
+        self.assertLess(abs(aligned["fast"] - aligned["slow"]), 0.015)
+
+    def test_paced_writes_follow_each_link(self):
+        _, counts = self.run_feed(align=False, ack_every=8)
+        # slow link: one write per 0.10 / 2 / 0.8 = 62.5 ms (plus its acknowledged ones) in 1.5 s
+        self.assertTrue(15 <= counts["slow"] <= 30, counts)
+        self.assertGreater(counts["fast"], 3 * counts["slow"])
 
 
 class Devices(unittest.TestCase):
