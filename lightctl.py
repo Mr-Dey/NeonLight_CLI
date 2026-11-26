@@ -52,8 +52,9 @@ def log(msg: str, err: bool = True) -> None:
     print(msg, file=sys.stderr if err else sys.stdout, flush=True)
 
 DEFAULT_ADDR = "BE:69:32:13:B6:00"
-# Channel wiring of this strip, verified by hand: byte1 lights green, byte2 blue, byte3 red.
-DEFAULT_ORDER = "gbr"
+# Colour order for strips saved without --order. Both strips have their wiring stored on the
+# controller ("G R B" on the monitor strip, factory on the room strip), so plain rgb is right for both.
+DEFAULT_ORDER = "rgb"
 # Effects run on each controller with its own stored speed; with several strips we send this one
 # (unless --speed is given) so they move alike. 80 is what the loved music-effects run used.
 SYNC_SPEED = 80
@@ -1833,7 +1834,7 @@ def main() -> None:
                         "(default: every saved strip; env LIGHTCTL_ADDR)")
     c.add_argument("--devices", action="store_true", help="list saved strips")
     c.add_argument("--add-device", nargs=2, metavar=("NAME", "MAC"),
-                   help="save a strip under a name (add --order to record its wiring; default gbr)")
+                   help="save a strip under a name (add --order to record its wiring; default rgb)")
     c.add_argument("--remove-device", metavar="NAME", help="forget a saved strip")
     c.add_argument("--order", type=parse_order,
                    help="colour wiring of the chosen strips, overriding what is saved (rgb, gbr, ...)")
