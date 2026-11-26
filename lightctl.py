@@ -329,10 +329,34 @@ def parse_pct(s: str) -> int:
     return v
 
 
+def group_lists() -> dict[str, list[tuple[str, int]]]:
+    """Effects per app tab, in the app's display order (the app numbers them from 1)."""
+    out: dict[str, list[tuple[str, int]]] = {}
+    for name, (group, mid) in MODES.items():
+        out.setdefault(group.lower(), []).append((name, mid))
+    return out
+
+
+def mode_matches(filter_: str | None, name: str, group: str) -> bool:
+    if not filter_:
+        return True
+    f = filter_.lower()
+    return f in name or f == group.lower()
+
+
 def parse_mode(s: str) -> int:
     key = s.strip().lower()
     if key in MODES:
         return MODES[key][1]
+    if key == "random":
+        return random.choice(list(MODES.values()))[1]
+    if ":" in key:  # app-style "tab:number", e.g. run:12
+        grp, _, idx = key.partition(":")
+        lst = group_lists().get(grp)
+        if lst and idx.isdigit() and 1 <= int(idx) <= len(lst):
+            return lst[int(idx) - 1][1]
+        tabs = ", ".join(f"{g}:1-{len(v)}" for g, v in group_lists().items())
+        raise argparse.ArgumentTypeError(f"bad tab:number {s!r}; valid: {tabs}")
     try:
         v = int(key, 0)
     except ValueError:
@@ -359,14 +383,45 @@ def parse_raw(s: str) -> bytes:
 
 
 def list_modes(filter_: str | None) -> None:
-    current = None
-    for name, (group, mid) in MODES.items():
-        if filter_ and filter_.lower() not in name and filter_.lower() != group.lower():
+    for group, items in group_lists().items():
+        shown = [(i, n, m) for i, (n, m) in enumerate(items, 1)
+                 if mode_matches(filter_, n, MODES[n][0])]
+        if not shown:
             continue
-        if group != current:
-            print(f"\n{group}:")
-            current = group
-        print(f"  {name:<34} 0x{mid:02x}")
+        print(f"\n{MODES[items[0][0]][0]}  (use {group}:N or the name)")
+        for i, name, mid in shown:
+            print(f"  {i:>3}  {name:<34} 0x{mid:02x}")
+
+
+async def tour(addr: str, filter_: str | None, interval: float, speed: int | None,
+               duration: float) -> None:
+    """Play effects one after another, printing each, so you can find the ones you like."""
+    items = []
+    for group, lst in group_lists().items():
+        for i, (name, mid) in enumerate(lst, 1):
+            if mode_matches(filter_, name, MODES[name][0]):
+                items.append((f"{group}:{i}", name, mid))
+    if not items:
+        raise SystemExit(f"lightctl: no effects match {filter_!r} (see --list-modes)")
+    async with BleakClient(addr, timeout=15) as client:
+        await asyncio.sleep(0.3)
+        w = lambda pkt: client.write_gatt_char(WRITE_CHAR, pkt, response=True)  # noqa: E731
+        await w(cmd_power(True))
+        if speed is not None:
+            await w(cmd_speed(speed))
+        loop = asyncio.get_running_loop()
+        t0 = loop.time()
+        print(f"touring {len(items)} effects, {interval:g}s each - Ctrl-C keeps the current one",
+              file=sys.stderr)
+        try:
+            for n, (ref, name, mid) in enumerate(items, 1):
+                if duration and loop.time() - t0 >= duration:
+                    break
+                print(f"[{n:>3}/{len(items)}] {ref:<12} {name:<34} 0x{mid:02x}", flush=True)
+                await w(cmd_mode(mid))
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            pass
 
 
 # ---------- BLE ----------
@@ -518,6 +573,10 @@ def main() -> None:
     p.add_argument("--scan", action="store_true", help="find nearby LED controllers")
     p.add_argument("--list-modes", nargs="?", const="", metavar="FILTER",
                    help="list effects, optionally filtered by word or group")
+    p.add_argument("--tour", nargs="?", const="", metavar="FILTER",
+                   help="play effects one by one (all, a group like 'water', or a word like 'rainbow')")
+    p.add_argument("--interval", "-i", type=float, default=8,
+                   help="seconds per effect in --tour (default 8)")
     g = p.add_argument_group("host-driven animation (laptop stays connected)")
     g.add_argument("--animate", "-a", choices=list(ANIMATIONS),
                    help="stream an animation; --color sets the base colour for breathe")
@@ -540,6 +599,12 @@ def main() -> None:
 
     if a.list_modes is not None:
         list_modes(a.list_modes or None)
+        return
+    if a.tour is not None:
+        try:
+            asyncio.run(tour(a.addr, a.tour or None, a.interval, a.speed, a.duration))
+        except KeyboardInterrupt:
+            print("stopped - the last effect listed keeps running", file=sys.stderr)
         return
     if a.scan:
         asyncio.run(scan(8))

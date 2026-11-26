@@ -41,8 +41,12 @@ export LIGHTCTL_ADDR=AA:BB:CC:DD:EE:FF
 ```bash
 lightctl --power on --color red --brightness 60
 lightctl --color 255,120,0                    # or ff7800, #f70, warm, purple…
-lightctl --mode 7-color-race --speed 70       # built-in effect
-lightctl --list-modes water                   # search effects by word or group
+lightctl --mode 7-color-race --speed 70       # built-in effect by name
+lightctl --mode run:12                        # or by app tab + number, as numbered in the app
+lightctl --mode random
+lightctl --list-modes water                   # search effects by word or tab
+lightctl --tour                               # play all 213 effects one by one, printing names
+lightctl --tour flow --interval 5 --speed 80  # tour one tab (or a word like "rainbow")
 lightctl --animate rainbow                    # streams until Ctrl-C
 lightctl --animate breathe --color purple --period 5
 lightctl --animate fire --fast --duration 30
@@ -65,6 +69,13 @@ silently dropped by the controller.
 | Brightness    | `7e 04 01 BB LM ff ff 00 ef`           | BB 0–100; LM `01` = RGB mode, `ff` = keep |
 | Effect        | `7e 05 03 MM 06 ff ff 00 ef`           | MM = effect id (`--list-modes`)         |
 | Effect speed  | `7e 04 02 SS ff ff ff 00 ef`           | SS 0–100                                |
+
+### Effect coverage
+
+The 213 effects are every entry in the app's Mode tab (Basic, Curtain, Trans, Water,
+Flow, Tail, Run, RunBack), using the app's own ids. The app's 28 "Scenes"
+(`7e 05 31 <id> 07 ff ff 01 ef`) are only enabled for MELK-OC/OT controllers and one
+OA10 firmware. They had no effect on the tested strip, so they are left out.
 
 ### Channel order
 
