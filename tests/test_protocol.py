@@ -160,6 +160,39 @@ class Screen(unittest.TestCase):
         r, g, b = L.screen_color(self.frame((200, 150, 150)), saturation=4.0, floor=0, gain=1.0)
         self.assertLess(min(g, b), 5)  # a pale pink becomes a vivid red
 
+    @staticmethod
+    def split(top, bottom, top_rows):
+        w, h = L.SCREEN_W, L.SCREEN_H
+        return bytes(top) * (w * top_rows) + bytes(bottom) * (w * (h - top_rows))
+
+    def test_main_colour_beats_small_vivid_spot(self):
+        frame = self.split((255, 0, 0), (60, 90, 200), 5)   # small pure red strip, big soft blue
+        r, g, b = L.screen_color(frame, saturation=1.0, floor=0, gain=1.0, mode="dominant")
+        self.assertGreater(b, 2 * r)                         # the strip shows the blue
+        r2, g2, b2 = L.screen_color(frame, saturation=1.0, floor=0, gain=1.0, mode="vivid")
+        self.assertGreater(r2 / b2, r / b)                   # vivid lets the red pull it
+
+    def test_mostly_white_scene_stays_white(self):
+        frame = self.split((255, 0, 0), (235, 235, 235), 2)  # a little red on a white page
+        r, g, b = L.screen_color(frame, saturation=1.0, floor=0, gain=1.0, mode="dominant")
+        self.assertGreater(min(g, b), 0.8 * r)
+
+    def test_led_gamma_keeps_orange_orange(self):
+        frame = self.frame((255, 128, 0))
+        lin = L.screen_color(frame, saturation=1.0, floor=0, gain=1.0, led_gamma=1.0)
+        old = L.screen_color(frame, saturation=1.0, floor=0, gain=1.0, led_gamma=2.4)
+        self.assertAlmostEqual(lin[1], 255 * 0.2158, delta=4)  # the real light share of green
+        self.assertAlmostEqual(old[1], 255 * 0.2158 ** (1 / 2.4), delta=6)  # paler, yellower
+
+    def test_main_colour_does_not_flip_on_one_frame(self):
+        s = L.ScreenSampler("dominant", saturation=1.0, floor=0, gain=1.0)
+        red_more = self.split((255, 0, 0), (0, 0, 255), 15)   # 15 of 27 rows red
+        blue_more = self.split((255, 0, 0), (0, 0, 255), 12)
+        for _ in range(6):
+            s(red_more)
+        r, g, b = s(blue_more)  # one frame with slightly more blue doesn't switch the light
+        self.assertGreater(r, b)
+
     def test_dark_scene_dims_to_floor(self):
         r, g, b = L.screen_color(self.frame((20, 20, 20)), floor=5)
         self.assertLess(max(r, g, b), 40)

@@ -37,6 +37,7 @@ DEFAULTS = {
     "music_floor": 5,
     "screen_smooth": 0.12, "screen_saturation": 1.3, "screen_region": "full", "screen_floor": 5,
     "screen_gain": 1.25, "screen_fps": 12,
+    "screen_sample": "dominant", "screen_capture": "monitor", "screen_led_gamma": 1.0,
     "animation": "rainbow", "anim_period": 6.0,
     "timer_days": "daily",
     "muted": [],
@@ -51,7 +52,8 @@ TABS = ["light", "effects", "music", "screen", "anim", "timers", "strips"]
 
 SCREEN_RATES = [10, 12, 15, 20, 30, 60]
 CHOICES = {"music_style": list(MUSIC_STYLES), "music_switch": ["beat", "8", "15", "never"],
-           "screen_fps": SCREEN_RATES,
+           "screen_fps": SCREEN_RATES, "screen_sample": list(L.SAMPLE_MODES),
+           "screen_capture": ["monitor", "window"],
            "screen_region": ["full", "edges"], "animation": list(L.ANIMATIONS),
            "timer_days": ["daily", "weekdays", "weekends"]}
 
@@ -69,7 +71,7 @@ def load_settings() -> dict:
     if s["music_effect"] != "random" and s["music_effect"] not in L.MODES:
         s["music_effect"] = "random"
     for key in ("brightness", "speed", "tour_interval", "music_floor", "screen_smooth",
-                "screen_saturation", "screen_floor", "screen_gain", "anim_period"):
+                "screen_saturation", "screen_floor", "screen_gain", "screen_led_gamma", "anim_period"):
         if not isinstance(s[key], (int, float)):
             s[key] = DEFAULTS[key]
     if not isinstance(s["muted"], list):
@@ -288,6 +290,24 @@ class LightUI(App):
                     with Horizontal(classes="row"):
                         yield Label("Dark scenes", classes="lbl")
                         yield Level(s["screen_floor"], 0, 50, 1, id="screen-floor")
+                    yield Label("Colour from", classes="section")
+                    with RadioSet(id="screen-sample"):
+                        yield RadioButton("Main colour of the scene (most accurate)",
+                                          value=s["screen_sample"] == "dominant", id="ss-dominant")
+                        yield RadioButton("Average of the screen", value=s["screen_sample"] == "average",
+                                          id="ss-average")
+                        yield RadioButton("Brightest, most vivid spots (original)",
+                                          value=s["screen_sample"] == "vivid", id="ss-vivid")
+                    with Horizontal(classes="row"):
+                        yield Label("LED gamma", classes="lbl")
+                        yield Level(s["screen_led_gamma"], 1.0, 2.4, 0.1, "{:.1f}", id="screen-led-gamma")
+                    yield Label("1.0 sends the true light mix (orange stays orange on LEDs); higher looks paler, "
+                                "like the original.", classes="hint")
+                    yield Label("Capture", classes="section")
+                    with RadioSet(id="screen-capture"):
+                        yield RadioButton("Whole monitor", value=s["screen_capture"] == "monitor", id="sc-monitor")
+                        yield RadioButton("One window - e.g. the video player (pick it in the dialog)",
+                                          value=s["screen_capture"] == "window", id="sc-window")
                     yield Label("Sample", classes="section")
                     with RadioSet(id="screen-region"):
                         yield RadioButton("Whole screen", value=s["screen_region"] == "full", id="sr-full")
@@ -511,7 +531,8 @@ class LightUI(App):
         s = self.s
         return lambda: L.screen_sync(self.group, int(s["screen_fps"]), s["screen_smooth"], s["screen_region"],
                                      s["screen_saturation"], int(s["screen_floor"]), 0, False,
-                                     s["screen_gain"])
+                                     s["screen_gain"], s["screen_sample"], s["screen_led_gamma"],
+                                     s["screen_capture"])
 
     def anim_job(self):
         s = self.s
@@ -719,9 +740,11 @@ class LightUI(App):
     @on(Level.Changed, "#screen-saturation")
     @on(Level.Changed, "#screen-floor")
     @on(Level.Changed, "#screen-gain")
+    @on(Level.Changed, "#screen-led-gamma")
     def screen_option(self, ev: Level.Changed) -> None:
         key = {"screen-smooth": "screen_smooth", "screen-saturation": "screen_saturation",
-               "screen-floor": "screen_floor", "screen-gain": "screen_gain"}[ev.level.id]
+               "screen-floor": "screen_floor", "screen-gain": "screen_gain",
+               "screen-led-gamma": "screen_led_gamma"}[ev.level.id]
         self.save(**{key: round(ev.value, 3)})
         if self.mode_name == "screen":
             self.restart_soon("screen")
@@ -733,8 +756,12 @@ class LightUI(App):
             self.restart_soon("screen")
 
     @on(RadioSet.Changed, "#screen-region")
-    def screen_region(self, ev: RadioSet.Changed) -> None:
-        self.save(screen_region=ev.pressed.id.removeprefix("sr-"))
+    @on(RadioSet.Changed, "#screen-sample")
+    @on(RadioSet.Changed, "#screen-capture")
+    def screen_choice(self, ev: RadioSet.Changed) -> None:
+        key, prefix = {"screen-region": ("screen_region", "sr-"), "screen-sample": ("screen_sample", "ss-"),
+                       "screen-capture": ("screen_capture", "sc-")}[ev.radio_set.id]
+        self.save(**{key: ev.pressed.id.removeprefix(prefix)})
         if self.mode_name == "screen":
             self.restart_soon("screen")
 

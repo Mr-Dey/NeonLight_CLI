@@ -121,6 +121,8 @@ lightctl --screen                             # first run asks which monitor to 
 lightctl --screen --smooth 0.3 --saturation 3 --gain 1.6   # slower fades, vivid, brighter
 lightctl --screen --fps 30                    # target rate; capped at what the link delivers
 lightctl --screen --region edges --floor 0    # only the screen edges; off in dark scenes
+lightctl --screen --capture window            # only the video player window (pick it once)
+lightctl --screen --sample average            # plain average instead of the scene's main colour
 lightctl --screen-reset                       # pick a different monitor next time
 
 # the controller's own microphone
@@ -192,12 +194,27 @@ on the tested unit, and changing its sensitivity in real time did not animate it
 `~/.config/lightctl/screencast-token`, so later runs start straight away. While it runs, KDE
 shows its usual screen-sharing indicator.
 
-GStreamer receives the PipeWire stream at up to 12 frames/s, shrinks each frame to 48×27
-and hands it to Python. The colour is a weighted mix in linear light: vivid, bright pixels
-count most, black bars and dark UI hardly count. The strip's brightness follows how bright
-the screen is (never below `--floor`), and the colour fades over `--smooth` seconds.
-On the tested laptop this used about 7 % of one CPU core for GStreamer plus about 2 ms of
-Python per frame.
+GStreamer receives the PipeWire stream (at most 20 frames/s), shrinks each frame to 48×27
+with an area-averaging filter (`bilinear2`, so every cell is the true average of its part of
+the screen) and hands it to Python. `--capture window` shares a single window instead of the
+monitor, so a video that isn't full screen isn't mixed with the desktop.
+
+How the colour is picked (`--sample`):
+
+- `dominant` (default): the hue covering the most colourful screen area, from a 24-bin hue
+  histogram smoothed over time (so it doesn't flip between two similar areas). Its colour is
+  averaged from those pixels. Scenes that are mostly white or grey blend into their real,
+  tinted average instead of picking a small coloured spot.
+- `average`: the plain average of the screen, which is what a diffuser in front of it would show.
+- `vivid`: every pixel weighted by brightness × colourfulness (the original behaviour).
+
+Colours are mixed in linear light and, with `--led-gamma 1.0` (default), sent as true light
+ratios. Plain PWM LEDs respond linearly, so orange stays orange and skin stays tan; screen-style
+encoding (`--led-gamma 2.2`, the original) looks paler and yellower on LEDs. Brightness follows
+how bright the screen is (`--gain`, never below `--floor`). The colour fades with a
+`--smooth` time constant measured in real time, so fades stay the same length whatever rate
+the link manages. On the tested laptop this used about 14 % of one CPU core for GStreamer plus
+a few ms of Python per frame.
 
 The strip shows one colour at a time (the controller has no per-LED command), so this is a
 single-zone glow, not separate colours per edge.

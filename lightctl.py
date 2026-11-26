@@ -1212,8 +1212,9 @@ class ScreenCapture:
     PATH = "/org/freedesktop/portal/desktop"
     IFACE = "org.freedesktop.portal.ScreenCast"
 
-    def __init__(self, fps: float, verbose: bool = False) -> None:
-        self.fps, self.verbose = fps, verbose
+    def __init__(self, fps: float, verbose: bool = False, target: str = "monitor") -> None:
+        self.fps, self.verbose, self.target = fps, verbose, target
+        self.token_file = TOKEN_FILE if target == "monitor" else TOKEN_FILE + "-window"
         self.bus = self.session = self.proc = None
 
     async def _call(self, member: str, signature: str, body: list, interface: str | None = None):
@@ -1261,20 +1262,22 @@ class ScreenCapture:
         res = await self._request("CreateSession", "a{sv}", [],
                                   {"session_handle_token": Variant("s", f"lightctl{random.randrange(1 << 30)}")})
         self.session = res["session_handle"]
-        opts = {"types": Variant("u", 1),          # monitors
+        opts = {"types": Variant("u", 1 if self.target == "monitor" else 2),  # a monitor / one window
                 "multiple": Variant("b", False),
                 "cursor_mode": Variant("u", 1),    # hidden
                 "persist_mode": Variant("u", 2)}   # remember until revoked
         try:
-            with open(TOKEN_FILE) as f:
+            with open(self.token_file) as f:
                 opts["restore_token"] = Variant("s", f.read().strip())
         except OSError:
-            log("Your desktop will ask which screen to share: pick the monitor the strip is behind.")
+            log("Your desktop will ask what to share: pick the monitor the strip is behind."
+                if self.target == "monitor" else
+                "Your desktop will ask what to share: pick the window playing the video.")
         await self._request("SelectSources", "oa{sv}", [self.session], opts)
         res = await self._request("Start", "osa{sv}", [self.session, ""], {})
         if res.get("restore_token"):
-            os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
-            fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            os.makedirs(os.path.dirname(self.token_file), exist_ok=True)
+            fd = os.open(self.token_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "w") as f:
                 f.write(res["restore_token"])
         node = res["streams"][0][0]
@@ -1287,7 +1290,9 @@ class ScreenCapture:
             # ask the compositor for at most fps frames (saves CPU), and enforce it with videorate
             f"video/x-raw,max-framerate={max(1, round(self.fps))}/1", "!",
             "videorate", "drop-only=true", f"max-rate={max(1, round(self.fps))}", "!",
-            "videoscale", "add-borders=false", "!", "videoconvert", "!",
+            # multi-tap bilinear: every output pixel is the average of its whole screen area
+            # (the default 2-tap filter only looks at a few pixels when shrinking this much)
+            "videoscale", "method=bilinear2", "add-borders=false", "!", "videoconvert", "!",
             f"video/x-raw,format=RGB,width={SCREEN_W},height={SCREEN_H}", "!",
             "fdsink", "fd=1", "sync=false",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, pass_fds=(fd,))
@@ -1324,63 +1329,135 @@ def _srgb(x: float) -> float:
     return 12.92 * x if x <= 0.0031308 else 1.055 * x ** (1 / 2.4) - 0.055
 
 
-def screen_color(frame: bytes, region: str = "full", saturation: float = 1.3,
-                 floor: int = 5, gain: float = 1.25) -> tuple[float, float, float] | None:
-    """One colour for the whole screen, 0-255 floats; None if the frame is entirely black.
+def _hue(r: int, g: int, b: int, mx: int, mn: int) -> float:
+    d = mx - mn
+    if mx == r:
+        h = ((g - b) / d) % 6
+    elif mx == g:
+        h = (b - r) / d + 2
+    else:
+        h = (r - g) / d + 4
+    return h / 6
 
-    Colours are mixed in linear light. Each pixel counts by brightness x colourfulness, so vivid
-    areas lead and black bars or dark UI don't wash the result out. How bright the strip glows follows
-    the screen's average brightness (each pixel's strongest channel, so a vivid red screen counts as
-    bright), times `gain`, never below `floor` %; `saturation` makes the colour punchier.
+
+SAMPLE_MODES = {
+    "dominant": "the main colour of the scene",
+    "average": "the plain average of the screen",
+    "vivid": "biased to bright, saturated spots (the original behaviour)",
+}
+
+
+class ScreenSampler:
+    """Turns screen frames (SCREEN_W x SCREEN_H RGB) into one strip colour, as 0-255 floats.
+
+    Modes:
+      dominant - the hue that covers the most colourful screen area (a hue histogram, smoothed over
+                 time so it doesn't flip between two similar areas), with its colour averaged from
+                 those pixels; scenes that are mostly white/grey blend into their real tinted average
+      average  - the plain average of the screen (what a diffuser in front of it would show)
+      vivid    - every pixel weighted by brightness x colourfulness (the original behaviour)
+    Colours are mixed in linear light. `led_gamma` sets how the mix is sent: 1.0 sends the true light
+    ratios, right for LEDs driven by plain PWM (orange stays orange, skin stays tan); 2.2-2.4 encodes
+    them like a screen does, which looks paler on LEDs (the original behaviour).
+    Brightness follows the screen's average brightness x `gain`, never below `floor` %.
     """
-    w, h = SCREEN_W, SCREEN_H
-    band = max(1, round(min(w, h) * 0.2))
-    sr = sg = sb = sw = vsum = 0.0
-    n = 0
-    for y in range(h):
-        edge_row = y < band or y >= h - band
-        base = y * w * 3
-        for x in range(w):
-            if region == "edges" and not (edge_row or x < band or x >= w - band):
-                continue
-            i = base + x * 3
+
+    BINS = 24
+
+    def __init__(self, mode: str = "dominant", region: str = "full", saturation: float = 1.3,
+                 floor: int = 5, gain: float = 1.25, led_gamma: float = 1.0) -> None:
+        if mode not in SAMPLE_MODES:
+            raise ValueError(f"unknown sample mode {mode!r}")
+        self.mode, self.saturation, self.floor, self.gain = mode, saturation, floor, gain
+        self.led_gamma = max(0.1, led_gamma)
+        self.hist = [0.0] * self.BINS
+        w, h = SCREEN_W, SCREEN_H
+        band = max(1, round(min(w, h) * 0.2))
+        self.cells = [(y * w + x) * 3 for y in range(h) for x in range(w)
+                      if region != "edges" or y < band or y >= h - band or x < band or x >= w - band]
+
+    def __call__(self, frame: bytes) -> tuple[float, float, float] | None:
+        bins = self.BINS
+        lit, vsum = 0, 0.0
+        avg = [0.0, 0.0, 0.0]
+        viv = [0.0, 0.0, 0.0, 0.0]
+        hist = [0.0] * bins
+        colourful = []  # (bin, chroma, linear r, g, b)
+        for i in self.cells:
             r, g, b = frame[i], frame[i + 1], frame[i + 2]
             mx = max(r, g, b)
-            n += 1
             if mx == 0:
                 continue
-            lr, lg, lb = _LINEAR[r], _LINEAR[g], _LINEAR[b]
+            mn = min(r, g, b)
+            lit += 1
             vsum += mx / 255
-            wgt = (mx / 255) * (0.15 + (mx - min(r, g, b)) / mx)
-            sr += lr * wgt
-            sg += lg * wgt
-            sb += lb * wgt
-            sw += wgt
-    if sw == 0:
-        return None
-    lr, lg, lb = sr / sw, sg / sw, sb / sw
-    peak = max(lr, lg, lb) or 1.0
-    hue, sat, _ = colorsys.rgb_to_hsv(_srgb(lr / peak), _srgb(lg / peak), _srgb(lb / peak))
-    level = min(1.0, vsum / n * gain)  # average brightness of the screen, lifted by `gain`
-    value = (floor + (100 - floor) * level) / 100
-    r, g, b = colorsys.hsv_to_rgb(hue, min(1.0, sat * saturation), value)
-    return r * 255, g * 255, b * 255
+            lr, lg, lb = _LINEAR[r], _LINEAR[g], _LINEAR[b]
+            avg[0] += lr
+            avg[1] += lg
+            avg[2] += lb
+            wv = (mx / 255) * (0.15 + (mx - mn) / mx)
+            viv[0] += lr * wv
+            viv[1] += lg * wv
+            viv[2] += lb * wv
+            viv[3] += wv
+            chroma = (mx - mn) / 255
+            if chroma >= 0.1 and mx >= 24:
+                k = int(_hue(r, g, b, mx, mn) * bins) % bins
+                hist[k] += chroma
+                colourful.append((k, chroma, lr, lg, lb))
+        if lit == 0:
+            return None
+        if self.mode == "vivid":
+            lin = [v / viv[3] for v in viv[:3]]
+        elif self.mode == "average":
+            lin = [v / lit for v in avg]
+        else:
+            self.hist = [0.6 * o + 0.4 * x for o, x in zip(self.hist, hist)]
+            smooth = [0.25 * self.hist[k - 1] + 0.5 * self.hist[k] + 0.25 * self.hist[(k + 1) % bins]
+                      for k in range(bins)]
+            peak = max(range(bins), key=smooth.__getitem__)
+            sel = [c for c in colourful if min((c[0] - peak) % bins, (peak - c[0]) % bins) <= 1]
+            base = [v / lit for v in avg]
+            if sel:
+                wsum = sum(c[1] for c in sel)
+                dom = [sum(c[1] * c[2 + j] for c in sel) / wsum for j in range(3)]
+                share = len(colourful) / lit  # how much of the lit screen is colourful at all
+                t = min(1.0, max(0.0, (share - 0.08) / 0.17))
+                lin = [a + (d - a) * t for a, d in zip(base, dom)]
+            else:
+                lin = base
+        top = max(lin) or 1.0
+        ratios = [(v / top) ** (1 / self.led_gamma) for v in lin]
+        hue, sat, _ = colorsys.rgb_to_hsv(*ratios)
+        level = min(1.0, vsum / len(self.cells) * self.gain)
+        value = (self.floor + (100 - self.floor) * level) / 100
+        r, g, b = colorsys.hsv_to_rgb(hue, min(1.0, sat * self.saturation), value)
+        return r * 255, g * 255, b * 255
+
+
+def screen_color(frame: bytes, region: str = "full", saturation: float = 1.3, floor: int = 5,
+                 gain: float = 1.25, mode: str = "dominant", led_gamma: float = 1.0):
+    """One-off colour of a single frame (see ScreenSampler)."""
+    return ScreenSampler(mode, region, saturation, floor, gain, led_gamma)(frame)
 
 
 async def screen_sync(devices: list[Device], fps: float, smooth: float, region: str, saturation: float,
-                      floor: int, duration: float, verbose: bool, gain: float = 1.25) -> None:
+                      floor: int, duration: float, verbose: bool, gain: float = 1.25,
+                      mode: str = "dominant", led_gamma: float = 1.0, capture: str = "monitor") -> None:
     """Capture -> one colour per frame -> smooth fade at `fps` -> unacknowledged colour frames."""
     target: list[float] | None = None
-    # capturing faster than ~30/s costs CPU without making the light any smoother
-    async with ScreenCapture(min(fps, 30), verbose) as cap, _connected(devices, verbose) as g:
+    sampler = ScreenSampler(mode, region, saturation, floor, gain, led_gamma)
+    # capturing faster than ~20/s costs CPU (and laptop heat) without making the light smoother:
+    # the link delivers ~10-16 updates/s and the fade fills in between
+    async with ScreenCapture(min(fps, 20), verbose, capture) as cap, _connected(devices, verbose) as g:
         await g.write(cmd_power(True))
         await g.write(cmd_brightness(100, 0x01))
-        log(f"screen sync on {g.names()} at {fps:g} updates/s, fade {smooth:g}s")
+        log(f"screen sync on {g.names()}: {SAMPLE_MODES[mode]}, up to {fps:g} updates/s, fade {smooth:g}s")
 
         async def reader() -> None:
             nonlocal target
             while True:
-                c = screen_color(await cap.frame(), region, saturation, floor, gain)
+                c = sampler(await cap.frame())
                 if c is not None:
                     target = list(c)
                 elif target is not None:  # black screen: keep the hue, drop to the floor
@@ -1390,7 +1467,7 @@ async def screen_sync(devices: list[Device], fps: float, smooth: float, region: 
         task = asyncio.create_task(reader())
         loop = asyncio.get_running_loop()
         t0 = loop.time()
-        alpha = 1 - math.exp(-1 / (fps * smooth)) if smooth > 0 else 1.0
+        last_t = t0
         cur: list[float] | None = None
         last: tuple[int, int, int] | None = None
         frames = 0
@@ -1399,6 +1476,9 @@ async def screen_sync(devices: list[Device], fps: float, smooth: float, region: 
                 tick = loop.time()
                 if task.done():
                     task.result()  # re-raise capture errors
+                # fade by the real time since the last update (the link may run slower than fps)
+                alpha = 1 - math.exp(-(tick - last_t) / smooth) if smooth > 0 else 1.0
+                last_t = tick
                 if target is not None:
                     cur = list(target) if cur is None else [c + (t - c) * alpha for c, t in zip(cur, target)]
                     out = tuple(max(0, min(255, round(v))) for v in cur)
@@ -1570,6 +1650,14 @@ def main() -> None:
                     help="brightness boost, 1.0 = as bright as the screen (default 1.25)")
     sc.add_argument("--region", choices=["full", "edges"], default="full",
                     help="sample the whole screen (default) or only its outer edges")
+    sc.add_argument("--sample", choices=list(SAMPLE_MODES), default="dominant",
+                    help="how the colour is picked: dominant = the scene's main colour (default), "
+                         "average = plain average, vivid = bright saturated spots (original)")
+    sc.add_argument("--led-gamma", type=float, default=1.0,
+                    help="1.0 = send true light mixes, right for PWM LEDs (default); 2.2 = paler, "
+                         "screen-like (original)")
+    sc.add_argument("--capture", choices=["monitor", "window"], default="monitor",
+                    help="share a whole monitor (default) or just one window, e.g. the video player")
     sc.add_argument("--screen-reset", action="store_true",
                     help="forget the shared-monitor choice so the next --screen asks again")
 
@@ -1677,18 +1765,19 @@ def main() -> None:
                     a.fps or 20, a.verbose, a.fast))
         return
     if a.screen_reset:
-        try:
-            os.remove(TOKEN_FILE)
-            print("forgot the shared monitor; the next --screen will ask again")
-        except FileNotFoundError:
-            print("nothing to forget")
+        gone = []
+        for path in (TOKEN_FILE, TOKEN_FILE + "-window"):
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(path)
+                gone.append(path)
+        print("forgot what to share; the next --screen will ask again" if gone else "nothing to forget")
         if not a.screen:
             return
     if a.screen:
-        if a.smooth < 0 or a.saturation < 0 or a.gain <= 0:
-            p.error("--smooth and --saturation must not be negative, --gain must be positive")
+        if a.smooth < 0 or a.saturation < 0 or a.gain <= 0 or a.led_gamma <= 0:
+            p.error("--smooth/--saturation must not be negative, --gain/--led-gamma must be positive")
         run(screen_sync(devices, a.fps or 12, a.smooth, a.region, a.saturation, a.floor,
-                        a.duration, a.verbose, a.gain))
+                        a.duration, a.verbose, a.gain, a.sample, a.led_gamma, a.capture))
         return
     if a.music and a.effect:
         for spec in a.effect:  # validate names before connecting
